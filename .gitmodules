@@ -1,0 +1,3 @@
+[submodule "rosu-storyboard"]
+	path = rosu-storyboard
+	url = https://github.com/47565647456/rosu-storyboard

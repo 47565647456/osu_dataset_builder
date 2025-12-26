@@ -1,0 +1,38 @@
+[package]
+name = "osu-enricher"
+version = "0.1.0"
+edition = "2021"
+description = "Enrich osu! beatmap data with API metadata and PP calculations"
+
+[dependencies]
+# osu! API v2 client
+rosu-v2 = { version = "0.11", features = ["default"] }
+
+# Performance point calculation
+rosu-pp = { version = "3.1", features = ["tracing"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Data format
+arrow = "57"
+parquet = { version = "57", features = ["arrow"] }
+
+# Error handling
+anyhow = "1.0"
+
+# CLI and progress
+indicatif = "0.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Rate limiting
+governor = "0.10"
+
+# CLI arguments
+clap = { version = "4", features = ["derive"] }
+
+# Caching (simple file-based)
+directories = "6"

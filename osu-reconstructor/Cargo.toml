@@ -1,0 +1,22 @@
+[package]
+name = "osu-reconstructor"
+version = "0.1.0"
+edition = "2021"
+description = "Reconstruct osu! beatmap folders from parquet dataset"
+
+[lib]
+name = "osu_reconstructor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reconstruct"
+path = "src/bin/reconstruct.rs"
+
+[dependencies]
+anyhow = "1"
+arrow = "57"
+parquet = "57"
+rosu-map = { version = "0.2", features = ["tracing"] }
+rosu-storyboard = { version = "0.1" }
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"

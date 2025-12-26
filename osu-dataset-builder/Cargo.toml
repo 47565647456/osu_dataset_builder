@@ -1,0 +1,15 @@
+[package]
+name = "osu-dataset-builder"
+version = "0.1.0"
+edition = "2021"
+description = "Build parquet dataset from osu! beatmap folders"
+
+[dependencies]
+rosu-map = { version = "0.2", features = ["tracing"] }
+rosu-storyboard = { path = "../rosu-storyboard" }
+walkdir = "2.5"
+anyhow = "1.0"
+indicatif = "0.18"
+arrow = "57"
+parquet = { version = "57", features = ["arrow"] }
+rand = "0.9.2"
