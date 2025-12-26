@@ -71,7 +71,7 @@ fn main() -> Result<()> {
                 "{} - {} [{}] - osu-viewer",
                 beatmap.artist, beatmap.title, beatmap.version
             )),
-        vsync: false, // Uncapped framerate
+        vsync: true,
         ..Default::default()
     };
 

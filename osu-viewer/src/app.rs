@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 use std::collections::VecDeque;
 
-const FRAMETIME_HISTORY_SIZE: usize = 120;
+/// Number of bars to show in the graph
+const FRAMETIME_BAR_COUNT: usize = 60;
+/// Number of raw samples to average for each bar
+const SAMPLES_PER_BAR: usize = 4;
 
 /// Main application state
 pub struct OsuViewerApp {
@@ -24,8 +27,12 @@ pub struct OsuViewerApp {
     timeline: Timeline,
     /// Whether audio is available
     has_audio: bool,
-    /// Frame time history for graph (in milliseconds)
+    /// Frame time history for graph (averaged, in milliseconds)
     frametime_history: VecDeque<f32>,
+    /// Raw samples for current averaging window
+    raw_samples: Vec<f32>,
+    /// All raw samples for 1% low calculation
+    all_samples: VecDeque<f32>,
     /// Last frame time
     last_frame_time: Instant,
 }
@@ -61,7 +68,9 @@ impl OsuViewerApp {
             playback: PlaybackManager::new(total_duration),
             timeline: Timeline::new(),
             has_audio,
-            frametime_history: VecDeque::with_capacity(FRAMETIME_HISTORY_SIZE),
+            frametime_history: VecDeque::with_capacity(FRAMETIME_BAR_COUNT),
+            raw_samples: Vec::with_capacity(SAMPLES_PER_BAR),
+            all_samples: VecDeque::with_capacity(500), // ~8 seconds at 60fps
             last_frame_time: Instant::now(),
         }
     }
@@ -151,11 +160,40 @@ impl OsuViewerApp {
         let frametime_ms = now.duration_since(self.last_frame_time).as_secs_f32() * 1000.0;
         self.last_frame_time = now;
         
-        // Add to history
-        if self.frametime_history.len() >= FRAMETIME_HISTORY_SIZE {
-            self.frametime_history.pop_front();
+        // Add to raw samples buffer
+        self.raw_samples.push(frametime_ms);
+        
+        // Store for percentile calculation (keep last ~8 seconds)
+        if self.all_samples.len() >= 500 {
+            self.all_samples.pop_front();
         }
-        self.frametime_history.push_back(frametime_ms);
+        self.all_samples.push_back(frametime_ms);
+        
+        // When we have enough samples, compute average and add to history
+        if self.raw_samples.len() >= SAMPLES_PER_BAR {
+            let avg = self.raw_samples.iter().sum::<f32>() / self.raw_samples.len() as f32;
+            
+            if self.frametime_history.len() >= FRAMETIME_BAR_COUNT {
+                self.frametime_history.pop_front();
+            }
+            self.frametime_history.push_back(avg);
+            self.raw_samples.clear();
+        }
+    }
+    
+    /// Calculate 1% low (99th percentile of frametimes)
+    fn calculate_1_percent_low(&self) -> f32 {
+        if self.all_samples.len() < 10 {
+            return 0.0;
+        }
+        
+        let mut sorted: Vec<f32> = self.all_samples.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // 1% low = highest 1% of frametimes (worst frames)
+        let idx = ((sorted.len() as f32) * 0.99) as usize;
+        let idx = idx.min(sorted.len() - 1);
+        sorted[idx]
     }
     
     /// Draw frametime graph
@@ -165,75 +203,104 @@ impl OsuViewerApp {
         }
         
         // Background
-        painter.rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+        painter.rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
         painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(60, 60, 80)));
         
-        // Calculate max frametime for scaling (use 33ms = 30fps as baseline)
-        let max_ft = self.frametime_history.iter().copied().fold(33.3f32, f32::max);
-        let scale_max = max_ft.max(33.3);
+        // Calculate stats
+        let avg_ft: f32 = self.all_samples.iter().sum::<f32>() / self.all_samples.len().max(1) as f32;
+        let one_percent_low_ft = self.calculate_1_percent_low();
+        let one_percent_low_fps = if one_percent_low_ft > 0.0 { 1000.0 / one_percent_low_ft } else { 0.0 };
+        let avg_fps = if avg_ft > 0.0 { 1000.0 / avg_ft } else { 0.0 };
         
-        // Draw 16.67ms (60fps) and 33.33ms (30fps) lines
-        let line_y_60fps = rect.max.y - (16.67 / scale_max) * rect.height();
-        let line_y_30fps = rect.max.y - (33.33 / scale_max) * rect.height();
+        // Use a fixed scale (0-33.33ms) for consistency, but expand if needed
+        let max_ft = self.frametime_history.iter().copied().fold(16.67f32, f32::max);
+        let scale_max = max_ft.max(16.67).min(100.0); // Cap at 100ms for display
         
-        if line_y_60fps > rect.min.y {
+        // Graph area (lower portion of rect)
+        let text_height = 40.0;
+        let graph_rect = Rect::from_min_max(
+            Pos2::new(rect.min.x, rect.min.y + text_height),
+            rect.max,
+        );
+        
+        // Draw reference lines
+        let line_y_60fps = graph_rect.max.y - (16.67 / scale_max) * graph_rect.height();
+        if line_y_60fps > graph_rect.min.y {
             painter.line_segment(
-                [Pos2::new(rect.min.x, line_y_60fps), Pos2::new(rect.max.x, line_y_60fps)],
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 255, 0, 100)),
+                [Pos2::new(graph_rect.min.x, line_y_60fps), Pos2::new(graph_rect.max.x, line_y_60fps)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 255, 0, 60)),
             );
-        }
-        if line_y_30fps > rect.min.y && line_y_30fps < rect.max.y {
-            painter.line_segment(
-                [Pos2::new(rect.min.x, line_y_30fps), Pos2::new(rect.max.x, line_y_30fps)],
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 100)),
+            painter.text(
+                Pos2::new(graph_rect.max.x - 2.0, line_y_60fps - 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "60",
+                egui::FontId::monospace(8.0),
+                Color32::from_rgba_unmultiplied(0, 255, 0, 120),
             );
         }
         
         // Draw graph bars
-        let bar_width = rect.width() / FRAMETIME_HISTORY_SIZE as f32;
+        let bar_width = graph_rect.width() / FRAMETIME_BAR_COUNT as f32;
         
         for (i, &ft) in self.frametime_history.iter().enumerate() {
-            let x = rect.min.x + i as f32 * bar_width;
-            let height = (ft / scale_max) * rect.height();
-            let y = rect.max.y - height;
+            let x = graph_rect.min.x + i as f32 * bar_width;
+            let clamped_ft = ft.min(scale_max);
+            let height = (clamped_ft / scale_max) * graph_rect.height();
+            let y = graph_rect.max.y - height;
             
-            // Color based on frametime (green < 16.67ms, yellow < 33ms, red > 33ms)
-            let color = if ft <= 16.67 {
+            // Smooth color gradient based on frametime
+            let color = if ft <= 8.33 {
+                // <120fps: bright green
                 Color32::from_rgb(0, 255, 100)
+            } else if ft <= 16.67 {
+                // 60-120fps: green to yellow
+                let t = (ft - 8.33) / 8.34;
+                Color32::from_rgb((255.0 * t) as u8, 255, (100.0 * (1.0 - t)) as u8)
             } else if ft <= 33.33 {
-                Color32::from_rgb(255, 255, 0)
+                // 30-60fps: yellow to orange
+                let t = (ft - 16.67) / 16.66;
+                Color32::from_rgb(255, (255.0 * (1.0 - t * 0.5)) as u8, 0)
             } else {
-                Color32::from_rgb(255, 80, 80)
+                // <30fps: red
+                Color32::from_rgb(255, 60, 60)
             };
             
             let bar_rect = Rect::from_min_max(
                 Pos2::new(x, y),
-                Pos2::new(x + bar_width.max(1.0), rect.max.y),
+                Pos2::new(x + bar_width - 1.0, graph_rect.max.y),
             );
             painter.rect_filled(bar_rect, 0.0, color);
         }
         
-        // Draw current frametime and FPS text
-        if let Some(&current_ft) = self.frametime_history.back() {
-            let fps = 1000.0 / current_ft;
-            let avg_ft: f32 = self.frametime_history.iter().sum::<f32>() / self.frametime_history.len() as f32;
-            let avg_fps = 1000.0 / avg_ft;
-            
-            painter.text(
-                Pos2::new(rect.min.x + 4.0, rect.min.y + 2.0),
-                egui::Align2::LEFT_TOP,
-                format!("{:.1}ms ({:.0} FPS)", current_ft, fps),
-                egui::FontId::monospace(10.0),
-                Color32::WHITE,
-            );
-            painter.text(
-                Pos2::new(rect.min.x + 4.0, rect.min.y + 14.0),
-                egui::Align2::LEFT_TOP,
-                format!("avg: {:.1}ms ({:.0} FPS)", avg_ft, avg_fps),
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(180, 180, 180),
-            );
-        }
+        // Draw text stats
+        let current_ft = self.raw_samples.last().copied()
+            .or_else(|| self.frametime_history.back().copied())
+            .unwrap_or(0.0);
+        let current_fps = if current_ft > 0.0 { 1000.0 / current_ft } else { 0.0 };
+        
+        painter.text(
+            Pos2::new(rect.min.x + 4.0, rect.min.y + 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("FPS: {:.0}", current_fps),
+            egui::FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        
+        painter.text(
+            Pos2::new(rect.min.x + 4.0, rect.min.y + 16.0),
+            egui::Align2::LEFT_TOP,
+            format!("Avg: {:.0} | 1% Low: {:.0}", avg_fps, one_percent_low_fps),
+            egui::FontId::monospace(10.0),
+            Color32::from_rgb(180, 180, 180),
+        );
+        
+        painter.text(
+            Pos2::new(rect.min.x + 4.0, rect.min.y + 28.0),
+            egui::Align2::LEFT_TOP,
+            format!("{:.2}ms", avg_ft),
+            egui::FontId::monospace(9.0),
+            Color32::from_rgb(140, 140, 140),
+        );
     }
 }
 
@@ -272,9 +339,16 @@ impl eframe::App for OsuViewerApp {
                 renderer.draw_playfield_bg(&painter);
                 renderer.draw_objects(&painter, &self.beatmap, self.playback.current_time);
                 
+                // Draw countdown and break overlays
+                renderer.draw_countdown(&painter, &self.beatmap, self.playback.current_time);
+                renderer.draw_break(&painter, &self.beatmap, self.playback.current_time);
+                
+                // Draw combo counter in top-left corner
+                renderer.draw_combo_counter(&painter, &self.beatmap, self.playback.current_time);
+                
                 // Draw frametime graph in top-right corner
-                let graph_width = 200.0;
-                let graph_height = 60.0;
+                let graph_width = 180.0;
+                let graph_height = 80.0;
                 let graph_rect = Rect::from_min_size(
                     Pos2::new(playfield_rect.max.x - graph_width - 10.0, playfield_rect.min.y + 10.0),
                     Vec2::new(graph_width, graph_height),

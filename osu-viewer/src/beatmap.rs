@@ -1,6 +1,7 @@
 //! Beatmap wrapper with rendering-optimized data structures
 
 use rosu_map::section::hit_objects::{HitObjectKind, CurveBuffers};
+use rosu_map::section::general::CountdownType;
 
 /// osu! standard playfield dimensions
 pub const PLAYFIELD_WIDTH: f32 = 512.0;
@@ -39,6 +40,22 @@ pub enum RenderObjectKind {
     },
 }
 
+/// A break period in the beatmap
+#[derive(Debug, Clone, Copy)]
+pub struct BreakPeriod {
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
+/// Countdown state at a given time
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CountdownState {
+    None,
+    /// Number to display (3, 2, 1, Go!)
+    Number(i32),
+    Go,
+}
+
 /// Wrapper around a parsed beatmap with rendering data
 pub struct BeatmapView {
     /// Original beatmap data
@@ -53,6 +70,16 @@ pub struct BeatmapView {
     pub fade_in_time: f64,
     /// Total duration of the map in milliseconds
     pub total_duration: f64,
+    /// Break periods
+    pub breaks: Vec<BreakPeriod>,
+    /// Countdown type (None, Normal, HalfSpeed, DoubleSpeed)
+    pub countdown_type: CountdownType,
+    /// First object time
+    pub first_object_time: f64,
+    /// BPM for countdown timing (from first timing point)
+    pub countdown_beat_length: f64,
+    /// Total combo count (circles + slider heads + slider ticks + slider ends)
+    pub total_combo: u32,
 }
 
 impl BeatmapView {
@@ -74,6 +101,15 @@ impl BeatmapView {
 
         // Fade in is typically 400ms or 2/3 of approach time, whichever is smaller
         let fade_in_time = (approach_time * 2.0 / 3.0).min(400.0);
+
+        // Get countdown type
+        let countdown_type = beatmap.countdown;
+        
+        // Get beat length from first timing point for countdown
+        let countdown_beat_length = beatmap.control_points.timing_points
+            .first()
+            .map(|tp| tp.beat_len)
+            .unwrap_or(500.0); // Default 120 BPM
 
         // Process hit objects
         let mut objects = Vec::with_capacity(beatmap.hit_objects.len());
@@ -119,10 +155,10 @@ impl BeatmapView {
                             .collect()
                     };
                     
-                    // Get slider duration and span count
-                    let duration = slider.duration_with_bufs(&mut curve_buffers);
+                    // Get slider duration (total duration including all spans/repeats)
+                    let total_duration = slider.duration_with_bufs(&mut curve_buffers);
                     let span_count = slider.span_count() as u32;
-                    let end_time = hit_object.start_time + duration * span_count as f64;
+                    let end_time = hit_object.start_time + total_duration;
 
                     RenderObject {
                         start_time: hit_object.start_time,
@@ -132,7 +168,7 @@ impl BeatmapView {
                         combo_number,
                         kind: RenderObjectKind::Slider {
                             path_points,
-                            duration: end_time - hit_object.start_time,
+                            duration: total_duration,
                             repeats: span_count.saturating_sub(1),
                         },
                     }
@@ -156,12 +192,33 @@ impl BeatmapView {
             objects.push(render_obj);
         }
 
+        // Get first object time
+        let first_object_time = objects.first().map(|o| o.start_time).unwrap_or(0.0);
+
         // Calculate total duration
         let total_duration = objects
             .iter()
             .map(|o| o.end_time)
             .fold(0.0f64, |a, b| a.max(b))
             + 2000.0; // Add 2 seconds buffer
+
+        // Parse break periods from beatmap
+        let breaks: Vec<BreakPeriod> = beatmap.breaks
+            .iter()
+            .map(|b| BreakPeriod {
+                start_time: b.start_time,
+                end_time: b.end_time,
+            })
+            .collect();
+
+        // Calculate total combo (simplified: 1 per circle, repeats+1 per slider, 1 per spinner)
+        let total_combo: u32 = objects.iter().map(|obj| {
+            match &obj.kind {
+                RenderObjectKind::Circle => 1,
+                RenderObjectKind::Slider { repeats, .. } => repeats + 2, // head + end + each repeat
+                RenderObjectKind::Spinner { .. } => 1,
+            }
+        }).sum();
 
         Self {
             beatmap,
@@ -170,6 +227,11 @@ impl BeatmapView {
             approach_time,
             fade_in_time,
             total_duration,
+            breaks,
+            countdown_type,
+            first_object_time,
+            countdown_beat_length,
+            total_combo,
         }
     }
 
@@ -259,4 +321,76 @@ impl BeatmapView {
             None
         }
     }
+    
+    /// Check if we're in a break period
+    pub fn is_in_break(&self, current_time: f64) -> Option<&BreakPeriod> {
+        self.breaks.iter().find(|b| current_time >= b.start_time && current_time <= b.end_time)
+    }
+    
+    /// Get countdown state at current time
+    pub fn get_countdown_state(&self, current_time: f64) -> CountdownState {
+        if self.countdown_type == CountdownType::None {
+            return CountdownState::None;
+        }
+        
+        // Calculate countdown speed multiplier
+        let speed_mult = match self.countdown_type {
+            CountdownType::None => return CountdownState::None,
+            CountdownType::Normal => 1.0,
+            CountdownType::HalfSpeed => 0.5,
+            CountdownType::DoubleSpeed => 2.0,
+        };
+        
+        // Countdown beat length (adjusted for speed)
+        let beat_len = self.countdown_beat_length / speed_mult;
+        
+        // Countdown starts 4 beats before first object (3, 2, 1, Go!)
+        let countdown_start = self.first_object_time - beat_len * 4.0;
+        
+        if current_time < countdown_start {
+            return CountdownState::None;
+        }
+        
+        if current_time >= self.first_object_time {
+            // Show "Go!" briefly after first object time
+            if current_time < self.first_object_time + beat_len * 0.5 {
+                return CountdownState::Go;
+            }
+            return CountdownState::None;
+        }
+        
+        // Calculate which beat we're on
+        let time_since_start = current_time - countdown_start;
+        let beat_number = (time_since_start / beat_len) as i32;
+        
+        // 3, 2, 1, Go!
+        match beat_number {
+            0 => CountdownState::Number(3),
+            1 => CountdownState::Number(2),
+            2 => CountdownState::Number(1),
+            3 => CountdownState::Go,
+            _ => CountdownState::None,
+        }
+    }
+    
+    /// Get current combo count at a given time (number of objects hit up to that time)
+    pub fn get_current_combo(&self, current_time: f64) -> u32 {
+        let mut combo = 0u32;
+        
+        for obj in &self.objects {
+            if obj.end_time > current_time {
+                break;
+            }
+            
+            // Add combo for this object
+            combo += match &obj.kind {
+                RenderObjectKind::Circle => 1,
+                RenderObjectKind::Slider { repeats, .. } => repeats + 2,
+                RenderObjectKind::Spinner { .. } => 1,
+            };
+        }
+        
+        combo
+    }
 }
+

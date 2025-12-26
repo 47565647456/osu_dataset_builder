@@ -23,4 +23,4 @@ log = "0.4"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = false

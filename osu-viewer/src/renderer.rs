@@ -1,7 +1,7 @@
 //! Hit object rendering with white outlines and combo numbers
 
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT};
-use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2, Mesh, epaint::Vertex};
 
 /// Playfield renderer with coordinate transformation
 pub struct PlayfieldRenderer {
@@ -123,7 +123,173 @@ impl PlayfieldRenderer {
         }
     }
 
-    /// Draw a slider with white outline path and combo number
+    /// Generate a tessellated mesh for a slider body
+    fn generate_slider_mesh(
+        &self,
+        screen_points: &[Pos2],
+        radius: f32,
+        body_color: Color32,
+        border_color: Color32,
+    ) -> (Mesh, Mesh) {
+        let mut body_mesh = Mesh::default();
+        let mut border_mesh = Mesh::default();
+        
+        if screen_points.len() < 2 {
+            return (body_mesh, border_mesh);
+        }
+        
+        let border_width = 2.0;
+        let inner_radius = radius - border_width;
+        
+        // Generate offset points along the path
+        let mut left_points_outer: Vec<Pos2> = Vec::with_capacity(screen_points.len());
+        let mut right_points_outer: Vec<Pos2> = Vec::with_capacity(screen_points.len());
+        let mut left_points_inner: Vec<Pos2> = Vec::with_capacity(screen_points.len());
+        let mut right_points_inner: Vec<Pos2> = Vec::with_capacity(screen_points.len());
+        
+        for i in 0..screen_points.len() {
+            // Calculate tangent direction
+            let tangent = if i == 0 {
+                let dx = screen_points[1].x - screen_points[0].x;
+                let dy = screen_points[1].y - screen_points[0].y;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                Vec2::new(dx / len, dy / len)
+            } else if i == screen_points.len() - 1 {
+                let dx = screen_points[i].x - screen_points[i - 1].x;
+                let dy = screen_points[i].y - screen_points[i - 1].y;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                Vec2::new(dx / len, dy / len)
+            } else {
+                // Average of incoming and outgoing tangent
+                let dx1 = screen_points[i].x - screen_points[i - 1].x;
+                let dy1 = screen_points[i].y - screen_points[i - 1].y;
+                let dx2 = screen_points[i + 1].x - screen_points[i].x;
+                let dy2 = screen_points[i + 1].y - screen_points[i].y;
+                let dx = dx1 + dx2;
+                let dy = dy1 + dy2;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                Vec2::new(dx / len, dy / len)
+            };
+            
+            // Perpendicular (normal) direction
+            let normal = Vec2::new(-tangent.y, tangent.x);
+            
+            let point = screen_points[i];
+            left_points_outer.push(Pos2::new(point.x + normal.x * radius, point.y + normal.y * radius));
+            right_points_outer.push(Pos2::new(point.x - normal.x * radius, point.y - normal.y * radius));
+            left_points_inner.push(Pos2::new(point.x + normal.x * inner_radius, point.y + normal.y * inner_radius));
+            right_points_inner.push(Pos2::new(point.x - normal.x * inner_radius, point.y - normal.y * inner_radius));
+        }
+        
+        // Build body mesh (inner fill)
+        let white_uv = Pos2::new(0.0, 0.0); // egui uses this for solid colors
+        
+        for i in 0..screen_points.len() - 1 {
+            let base_idx = body_mesh.vertices.len() as u32;
+            
+            // Add 4 vertices for this segment
+            body_mesh.vertices.push(Vertex { pos: left_points_inner[i], uv: white_uv, color: body_color });
+            body_mesh.vertices.push(Vertex { pos: right_points_inner[i], uv: white_uv, color: body_color });
+            body_mesh.vertices.push(Vertex { pos: left_points_inner[i + 1], uv: white_uv, color: body_color });
+            body_mesh.vertices.push(Vertex { pos: right_points_inner[i + 1], uv: white_uv, color: body_color });
+            
+            // Two triangles for the quad
+            body_mesh.indices.extend_from_slice(&[
+                base_idx, base_idx + 1, base_idx + 2,
+                base_idx + 1, base_idx + 3, base_idx + 2,
+            ]);
+        }
+        
+        // Build border mesh (outer ring)
+        for i in 0..screen_points.len() - 1 {
+            let base_idx = border_mesh.vertices.len() as u32;
+            
+            // Left border strip
+            border_mesh.vertices.push(Vertex { pos: left_points_outer[i], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: left_points_inner[i], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: left_points_outer[i + 1], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: left_points_inner[i + 1], uv: white_uv, color: border_color });
+            
+            border_mesh.indices.extend_from_slice(&[
+                base_idx, base_idx + 1, base_idx + 2,
+                base_idx + 1, base_idx + 3, base_idx + 2,
+            ]);
+            
+            // Right border strip
+            let base_idx = border_mesh.vertices.len() as u32;
+            border_mesh.vertices.push(Vertex { pos: right_points_inner[i], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: right_points_outer[i], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: right_points_inner[i + 1], uv: white_uv, color: border_color });
+            border_mesh.vertices.push(Vertex { pos: right_points_outer[i + 1], uv: white_uv, color: border_color });
+            
+            border_mesh.indices.extend_from_slice(&[
+                base_idx, base_idx + 1, base_idx + 2,
+                base_idx + 1, base_idx + 3, base_idx + 2,
+            ]);
+        }
+        
+        (body_mesh, border_mesh)
+    }
+    
+    /// Generate a circle mesh for slider caps
+    fn generate_circle_mesh(&self, center: Pos2, radius: f32, color: Color32, segments: usize) -> Mesh {
+        let mut mesh = Mesh::default();
+        let white_uv = Pos2::new(0.0, 0.0);
+        
+        // Center vertex
+        let center_idx = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex { pos: center, uv: white_uv, color });
+        
+        // Perimeter vertices
+        for i in 0..=segments {
+            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let x = center.x + angle.cos() * radius;
+            let y = center.y + angle.sin() * radius;
+            mesh.vertices.push(Vertex { pos: Pos2::new(x, y), uv: white_uv, color });
+        }
+        
+        // Triangle fan
+        for i in 0..segments as u32 {
+            mesh.indices.extend_from_slice(&[center_idx, center_idx + 1 + i, center_idx + 2 + i]);
+        }
+        
+        mesh
+    }
+    
+    /// Generate a circle border mesh (ring)
+    fn generate_circle_border_mesh(&self, center: Pos2, outer_radius: f32, inner_radius: f32, color: Color32, segments: usize) -> Mesh {
+        let mut mesh = Mesh::default();
+        let white_uv = Pos2::new(0.0, 0.0);
+        
+        for i in 0..=segments {
+            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            
+            mesh.vertices.push(Vertex { 
+                pos: Pos2::new(center.x + cos_a * outer_radius, center.y + sin_a * outer_radius), 
+                uv: white_uv, 
+                color 
+            });
+            mesh.vertices.push(Vertex { 
+                pos: Pos2::new(center.x + cos_a * inner_radius, center.y + sin_a * inner_radius), 
+                uv: white_uv, 
+                color 
+            });
+        }
+        
+        for i in 0..segments as u32 {
+            let base = i * 2;
+            mesh.indices.extend_from_slice(&[
+                base, base + 1, base + 2,
+                base + 1, base + 3, base + 2,
+            ]);
+        }
+        
+        mesh
+    }
+
+    /// Draw a slider with tessellated mesh body
     pub fn draw_slider(
         &self,
         painter: &egui::Painter,
@@ -138,52 +304,40 @@ impl PlayfieldRenderer {
             let stroke_color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
             let body_color = Color32::from_rgba_unmultiplied(60, 60, 80, alpha);
             let radius = self.scale_radius(circle_radius);
+            let border_width = 2.0;
+            let inner_radius = radius - border_width;
 
-            // Draw slider body as thick line segments
             if path_points.len() >= 2 {
+                // Downsample path for performance (every Nth point)
+                let step = (path_points.len() / 100).max(1);
                 let screen_points: Vec<Pos2> = path_points
                     .iter()
+                    .step_by(step)
+                    .chain(std::iter::once(path_points.last().unwrap())) // Always include last point
                     .map(|(x, y)| self.osu_to_screen(*x, *y))
                     .collect();
 
-                // Draw the body (filled path)
-                for window in screen_points.windows(2) {
-                    // Draw thick body line
-                    painter.line_segment(
-                        [window[0], window[1]],
-                        Stroke::new(radius * 2.0, body_color),
-                    );
-                }
+                // Generate and draw slider body mesh
+                let (body_mesh, border_mesh) = self.generate_slider_mesh(&screen_points, radius, body_color, stroke_color);
                 
-                // Draw the outline on top (thinner white line)
-                for window in screen_points.windows(2) {
-                    painter.line_segment(
-                        [window[0], window[1]],
-                        Stroke::new(2.0, stroke_color),
-                    );
-                }
+                painter.add(egui::Shape::mesh(body_mesh));
+                painter.add(egui::Shape::mesh(border_mesh));
 
-                // Draw end circle
-                if let Some(last) = screen_points.last() {
-                    painter.circle_filled(*last, radius, body_color);
-                    painter.circle_stroke(*last, radius, Stroke::new(2.0, stroke_color));
-                    
-                    // Draw reverse arrow at end if there are repeats
-                    if *repeats > 0 {
-                        self.draw_reverse_arrow(painter, &screen_points, false, radius, alpha);
-                    }
-                }
-                
-                // Draw reverse arrow at start if there are 2+ repeats
-                if *repeats >= 2 {
-                    self.draw_reverse_arrow(painter, &screen_points, true, radius, alpha);
+                // Draw end cap (filled circle + border ring)
+                if let Some(&last) = screen_points.last() {
+                    let cap_body = self.generate_circle_mesh(last, inner_radius, body_color, 24);
+                    let cap_border = self.generate_circle_border_mesh(last, radius, inner_radius, stroke_color, 24);
+                    painter.add(egui::Shape::mesh(cap_body));
+                    painter.add(egui::Shape::mesh(cap_border));
                 }
             }
 
-            // Draw start circle (head)
+            // Draw start circle (head) with mesh
             let center = self.osu_to_screen(obj.x, obj.y);
-            painter.circle_filled(center, radius, body_color);
-            painter.circle_stroke(center, radius, Stroke::new(3.0, stroke_color));
+            let head_body = self.generate_circle_mesh(center, inner_radius, body_color, 24);
+            let head_border = self.generate_circle_border_mesh(center, radius, inner_radius, stroke_color, 24);
+            painter.add(egui::Shape::mesh(head_body));
+            painter.add(egui::Shape::mesh(head_border));
 
             // Approach circle
             let time_until_hit = obj.start_time - current_time;
@@ -223,6 +377,32 @@ impl PlayfieldRenderer {
                     text_color,
                 );
             }
+            
+            // Draw reverse arrows LAST so they appear on top of everything
+            if path_points.len() >= 2 {
+                // For arrows, we need: first point, second point (for start arrow direction)
+                // and last point, second-to-last point (for end arrow direction)
+                let first_screen = self.osu_to_screen(path_points[0].0, path_points[0].1);
+                let second_screen = self.osu_to_screen(path_points[1].0, path_points[1].1);
+                let last_idx = path_points.len() - 1;
+                let second_last_idx = path_points.len().saturating_sub(2);
+                let last_screen = self.osu_to_screen(path_points[last_idx].0, path_points[last_idx].1);
+                let second_last_screen = self.osu_to_screen(path_points[second_last_idx].0, path_points[second_last_idx].1);
+                
+                // Build minimal screen_points for arrow drawing:
+                // [first, second, ..., second_last, last]
+                let arrow_points = vec![first_screen, second_screen, second_last_screen, last_screen];
+                
+                // Draw reverse arrow at end if there are repeats
+                if *repeats > 0 {
+                    self.draw_reverse_arrow(painter, &arrow_points, false, radius, alpha);
+                }
+                
+                // Draw reverse arrow at start if there are 2+ repeats
+                if *repeats >= 2 {
+                    self.draw_reverse_arrow(painter, &arrow_points, true, radius, alpha);
+                }
+            }
         }
     }
     
@@ -236,7 +416,7 @@ impl PlayfieldRenderer {
         alpha: u8,
     ) {
         let arrow_color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
-        let arrow_size = radius * 0.5;
+        let arrow_size = radius * 0.7;
         
         // Get the endpoint and a nearby point to calculate direction
         let (endpoint, direction_point) = if at_start {
@@ -259,10 +439,10 @@ impl PlayfieldRenderer {
         let dir_x = dx / len;
         let dir_y = dy / len;
         
-        // Arrow tip position (slightly inside the circle)
+        // Arrow tip position (at the circle edge, pointing inward)
         let tip = Pos2::new(
-            endpoint.x + dir_x * arrow_size * 0.5,
-            endpoint.y + dir_y * arrow_size * 0.5,
+            endpoint.x + dir_x * arrow_size * 0.3,
+            endpoint.y + dir_y * arrow_size * 0.3,
         );
         
         // Arrow base positions (perpendicular to direction)
@@ -270,17 +450,17 @@ impl PlayfieldRenderer {
         let perp_y = dir_x;
         
         let base1 = Pos2::new(
-            tip.x - dir_x * arrow_size + perp_x * arrow_size * 0.5,
-            tip.y - dir_y * arrow_size + perp_y * arrow_size * 0.5,
+            tip.x - dir_x * arrow_size + perp_x * arrow_size * 0.6,
+            tip.y - dir_y * arrow_size + perp_y * arrow_size * 0.6,
         );
         let base2 = Pos2::new(
-            tip.x - dir_x * arrow_size - perp_x * arrow_size * 0.5,
-            tip.y - dir_y * arrow_size - perp_y * arrow_size * 0.5,
+            tip.x - dir_x * arrow_size - perp_x * arrow_size * 0.6,
+            tip.y - dir_y * arrow_size - perp_y * arrow_size * 0.6,
         );
         
-        // Draw arrow as three lines forming a chevron
-        painter.line_segment([base1, tip], Stroke::new(3.0, arrow_color));
-        painter.line_segment([base2, tip], Stroke::new(3.0, arrow_color));
+        // Draw arrow as chevron with thicker lines
+        painter.line_segment([base1, tip], Stroke::new(4.0, arrow_color));
+        painter.line_segment([base2, tip], Stroke::new(4.0, arrow_color));
     }
 
     /// Draw a spinner with concentric circles
@@ -349,4 +529,176 @@ impl PlayfieldRenderer {
             }
         }
     }
+    
+    /// Draw countdown overlay (3, 2, 1, Go!)
+    pub fn draw_countdown(
+        &self,
+        painter: &egui::Painter,
+        beatmap: &BeatmapView,
+        current_time: f64,
+    ) {
+        use crate::beatmap::CountdownState;
+        
+        let state = beatmap.get_countdown_state(current_time);
+        
+        let text = match state {
+            CountdownState::None => return,
+            CountdownState::Number(n) => format!("{}", n),
+            CountdownState::Go => "Go!".to_string(),
+        };
+        
+        let center = Pos2::new(
+            self.playfield_rect.center().x,
+            self.playfield_rect.center().y,
+        );
+        
+        // Calculate pulse animation
+        let beat_len = beatmap.countdown_beat_length;
+        let time_in_beat = current_time % beat_len;
+        let beat_progress = (time_in_beat / beat_len) as f32;
+        let scale = 1.0 + (1.0 - beat_progress) * 0.3; // Pulse from 1.3 to 1.0
+        
+        // Large countdown number/text
+        let font_size = 120.0 * scale;
+        let alpha = ((1.0 - beat_progress * 0.5) * 255.0) as u8;
+        
+        // Color based on countdown value
+        let color = match state {
+            CountdownState::Number(3) => Color32::from_rgba_unmultiplied(255, 100, 100, alpha),
+            CountdownState::Number(2) => Color32::from_rgba_unmultiplied(255, 200, 100, alpha),
+            CountdownState::Number(1) => Color32::from_rgba_unmultiplied(100, 255, 100, alpha),
+            CountdownState::Number(_) => Color32::from_rgba_unmultiplied(255, 255, 255, alpha), // fallback
+            CountdownState::Go => Color32::from_rgba_unmultiplied(100, 200, 255, alpha),
+            CountdownState::None => return,
+        };
+        
+        // Draw shadow
+        painter.text(
+            Pos2::new(center.x + 4.0, center.y + 4.0),
+            egui::Align2::CENTER_CENTER,
+            &text,
+            FontId::proportional(font_size),
+            Color32::from_rgba_unmultiplied(0, 0, 0, alpha / 2),
+        );
+        
+        // Draw main text
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            &text,
+            FontId::proportional(font_size),
+            color,
+        );
+    }
+    
+    /// Draw break overlay
+    pub fn draw_break(
+        &self,
+        painter: &egui::Painter,
+        beatmap: &BeatmapView,
+        current_time: f64,
+    ) {
+        if let Some(break_period) = beatmap.is_in_break(current_time) {
+            let break_duration = break_period.end_time - break_period.start_time;
+            let time_in_break = current_time - break_period.start_time;
+            let time_remaining = break_period.end_time - current_time;
+            
+            // Only show break indicator if break is long enough (> 2 seconds)
+            if break_duration < 2000.0 {
+                return;
+            }
+            
+            let center = Pos2::new(
+                self.playfield_rect.center().x,
+                self.playfield_rect.min.y + 60.0,
+            );
+            
+            // Fade in/out
+            let fade_duration = 500.0;
+            let alpha = if time_in_break < fade_duration {
+                (time_in_break / fade_duration * 255.0) as u8
+            } else if time_remaining < fade_duration {
+                (time_remaining / fade_duration * 255.0) as u8
+            } else {
+                255
+            };
+            
+            // Draw "Break" text
+            let text_color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "Break",
+                FontId::proportional(36.0),
+                text_color,
+            );
+            
+            // Draw progress bar
+            let bar_width = 200.0;
+            let bar_height = 6.0;
+            let bar_y = center.y + 30.0;
+            
+            let bar_bg = Rect::from_center_size(
+                Pos2::new(center.x, bar_y),
+                Vec2::new(bar_width, bar_height),
+            );
+            
+            let progress = (time_in_break / break_duration) as f32;
+            let bar_fill = Rect::from_min_size(
+                Pos2::new(bar_bg.min.x, bar_bg.min.y),
+                Vec2::new(bar_width * progress, bar_height),
+            );
+            
+            let bg_alpha = alpha / 2;
+            painter.rect_filled(bar_bg, 3.0, Color32::from_rgba_unmultiplied(40, 40, 40, bg_alpha));
+            painter.rect_filled(bar_fill, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, alpha));
+            painter.rect_stroke(bar_bg, 3.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 100, 100, bg_alpha)));
+            
+            // Time remaining
+            let seconds_remaining = (time_remaining / 1000.0).ceil() as i32;
+            painter.text(
+                Pos2::new(center.x, bar_y + 20.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{}s", seconds_remaining),
+                FontId::proportional(16.0),
+                Color32::from_rgba_unmultiplied(180, 180, 180, alpha),
+            );
+        }
+    }
+    
+    /// Draw combo counter in top-left corner
+    pub fn draw_combo_counter(
+        &self,
+        painter: &egui::Painter,
+        beatmap: &BeatmapView,
+        current_time: f64,
+    ) {
+        let current_combo = beatmap.get_current_combo(current_time);
+        let total_combo = beatmap.total_combo;
+        
+        let pos = Pos2::new(self.playfield_rect.min.x + 10.0, self.playfield_rect.min.y + 10.0);
+        
+        // Background
+        let text = format!("{} / {}x", current_combo, total_combo);
+        let bg_rect = Rect::from_min_size(pos, Vec2::new(100.0, 28.0));
+        painter.rect_filled(bg_rect, 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+        
+        // Text
+        painter.text(
+            Pos2::new(pos.x + 6.0, pos.y + 4.0),
+            egui::Align2::LEFT_TOP,
+            "Combo",
+            FontId::proportional(10.0),
+            Color32::from_rgb(150, 150, 150),
+        );
+        
+        painter.text(
+            Pos2::new(pos.x + 6.0, pos.y + 14.0),
+            egui::Align2::LEFT_TOP,
+            text,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+    }
 }
+
