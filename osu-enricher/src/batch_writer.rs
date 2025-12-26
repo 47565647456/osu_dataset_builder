@@ -149,6 +149,9 @@ pub fn enriched_schema() -> Arc<Schema> {
         
         // is_convert
         Field::new("is_convert", DataType::Boolean, true),
+        
+        // PP calculation status
+        Field::new("pp_failed", DataType::Utf8, true),
     ]))
 }
 
@@ -254,6 +257,7 @@ impl EnrichedBatchWriter {
                 Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_objects).collect::<Vec<_>>())),
                 Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_hold_notes).collect::<Vec<_>>())),
                 Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_convert).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(rows.iter().map(|r| r.pp_failed.as_deref()).collect::<Vec<_>>())),
             ],
         )?;
         

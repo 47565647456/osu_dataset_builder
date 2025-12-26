@@ -346,6 +346,9 @@ impl eframe::App for OsuViewerApp {
                 // Draw combo counter in top-left corner
                 renderer.draw_combo_counter(&painter, &self.beatmap, self.playback.current_time);
                 
+                // Draw map stats below combo
+                renderer.draw_map_stats(&painter, &self.beatmap);
+                
                 // Draw frametime graph in top-right corner
                 let graph_width = 180.0;
                 let graph_height = 80.0;
@@ -406,7 +409,7 @@ impl eframe::App for OsuViewerApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label("Space: Play/Pause | ←/→: Seek | ↑/↓: Speed");
+                        ui.label("Space: Play/Pause | Left/Right: Seek | Up/Down: Speed");
                     });
                 });
 

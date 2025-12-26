@@ -400,6 +400,12 @@ Comprehensive beatmap data combining API metadata and rosu-pp calculations. One 
 |--------|------|-------------|
 | is_convert | bool? | Whether map is a convert |
 
+### Status
+
+| Column | Type | Description |
+|--------|------|-------------|
+| pp_failed | string? | Reason if PP calculation failed (e.g. "Suspicious map: Density") |
+
 ---
 
 ## beatmap_comments.parquet

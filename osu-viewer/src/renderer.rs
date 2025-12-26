@@ -308,8 +308,21 @@ impl PlayfieldRenderer {
             let inner_radius = radius - border_width;
 
             if path_points.len() >= 2 {
-                // Downsample path for performance (every Nth point)
-                let step = (path_points.len() / 100).max(1);
+                // Adaptive detail: more points for complex sliders
+                // Calculate approximate path length to determine detail level
+                let path_len: f32 = path_points.windows(2)
+                    .map(|w| {
+                        let dx = w[1].0 - w[0].0;
+                        let dy = w[1].1 - w[0].1;
+                        (dx * dx + dy * dy).sqrt()
+                    })
+                    .sum();
+                
+                // Target ~1 point per 3 osu!pixels for smooth curves
+                // But cap between 50-500 points for performance
+                let target_points = ((path_len / 3.0) as usize).clamp(50, 500);
+                let step = (path_points.len() / target_points).max(1);
+                
                 let screen_points: Vec<Pos2> = path_points
                     .iter()
                     .step_by(step)
@@ -698,6 +711,59 @@ impl PlayfieldRenderer {
             text,
             FontId::proportional(12.0),
             Color32::WHITE,
+        );
+    }
+    
+    /// Draw map stats panel on the left side
+    pub fn draw_map_stats(
+        &self,
+        painter: &egui::Painter,
+        beatmap: &BeatmapView,
+    ) {
+        let bm = &beatmap.beatmap;
+        
+        // Position below combo counter
+        let pos = Pos2::new(self.playfield_rect.min.x + 10.0, self.playfield_rect.min.y + 48.0);
+        
+        // Stats to display
+        let stats = [
+            ("AR", bm.approach_rate),
+            ("CS", bm.circle_size),
+            ("OD", bm.overall_difficulty),
+            ("HP", bm.hp_drain_rate),
+        ];
+        
+        // Calculate BPM from first timing point
+        let bpm = bm.control_points.timing_points
+            .first()
+            .map(|tp| 60000.0 / tp.beat_len)
+            .unwrap_or(0.0);
+        
+        // Background
+        let bg_height = 14.0 * (stats.len() + 1) as f32 + 8.0;
+        let bg_rect = Rect::from_min_size(pos, Vec2::new(70.0, bg_height));
+        painter.rect_filled(bg_rect, 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+        
+        // Draw stats
+        let mut y = pos.y + 4.0;
+        for (label, value) in stats {
+            painter.text(
+                Pos2::new(pos.x + 6.0, y),
+                egui::Align2::LEFT_TOP,
+                format!("{}: {:.1}", label, value),
+                FontId::monospace(11.0),
+                Color32::WHITE,
+            );
+            y += 14.0;
+        }
+        
+        // BPM
+        painter.text(
+            Pos2::new(pos.x + 6.0, y),
+            egui::Align2::LEFT_TOP,
+            format!("BPM: {:.0}", bpm),
+            FontId::monospace(11.0),
+            Color32::from_rgb(255, 200, 100),
         );
     }
 }

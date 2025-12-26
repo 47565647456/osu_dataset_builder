@@ -152,6 +152,9 @@ struct BeatmapRow {
     
     // Common for converts
     is_convert: Option<bool>,
+    
+    // PP calculation status
+    pp_failed: Option<String>,  // Reason if PP calculation failed (e.g., "Suspicious map: Density")
 }
 
 struct CommentRow {
@@ -347,6 +350,7 @@ async fn main() -> Result<()> {
             match calculate_difficulty(&osu_path, &mut row) {
                 Ok(_) => {}
                 Err(e) => {
+                    row.pp_failed = Some(format!("{}", e));
                     pb.println(format!("⚠ Failed to calculate PP for {}: {}", osu_file, e));
                 }
             }
