@@ -1,41 +1,84 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow::array::{Array, StringArray};
 use rosu_map::Beatmap;
 use rosu_storyboard::Storyboard;
 use std::collections::HashSet;
-use std::fs::{self};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use walkdir::WalkDir;
 use rand::seq::SliceRandom;
 use rand::rng;
 
 mod batch_writer;
 
-const SOURCE_DIR: &str = r"E:\osu_model\osu_archives_extracted";
-const OUTPUT_DIR: &str = r"E:\osu_model\dataset";
-const ASSETS_DIR: &str = r"E:\osu_model\dataset\assets";
+/// Build parquet dataset from osu! beatmap folders
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// Path to source directory containing extracted beatmap folders
+    #[arg(long, default_value = r"E:\osu_model\osu_archives_extracted")]
+    input_dir: PathBuf,
+
+    /// Path to output directory for parquet files
+    #[arg(long, default_value = r"E:\osu_model\dataset")]
+    output_dir: PathBuf,
+
+    /// Force rebuild, ignoring existing parquet data
+    #[arg(long, short)]
+    force: bool,
+
+    /// Test mode: only process 10 random folders
+    #[arg(long)]
+    test: bool,
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let test_mode = args.iter().any(|a| a == "--test");
+    let args = Args::parse();
     
-    fs::create_dir_all(OUTPUT_DIR)?;
-    fs::create_dir_all(ASSETS_DIR)?;
+    let assets_dir = args.output_dir.join("assets");
+    fs::create_dir_all(&args.output_dir)?;
+    fs::create_dir_all(&assets_dir)?;
 
-    let mut folders: Vec<PathBuf> = fs::read_dir(SOURCE_DIR)?
+    // Read existing processed folder_ids unless --force
+    let existing_folder_ids: HashSet<String> = if !args.force {
+        read_existing_folder_ids(&args.output_dir)
+    } else {
+        HashSet::new()
+    };
+
+    if !existing_folder_ids.is_empty() {
+        println!("Found {} already processed folders (use --force to rebuild)", existing_folder_ids.len());
+    }
+
+    let mut folders: Vec<PathBuf> = fs::read_dir(&args.input_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.path())
+        .filter(|p| {
+            // Skip already processed folders
+            let folder_name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            !existing_folder_ids.contains(&folder_name)
+        })
         .collect();
 
-    if test_mode {
+    if args.test {
         let mut rng = rng();
         folders.shuffle(&mut rng);
         folders.truncate(10);
-        println!("TEST MODE: Processing first 100 folders");
+        println!("TEST MODE: Processing 10 random folders");
     }
 
-    println!("Found {} beatmap folders to process", folders.len());
+    if folders.is_empty() {
+        println!("No new beatmap folders to process.");
+        return Ok(());
+    }
+
+    println!("Found {} new beatmap folders to process", folders.len());
 
     let pb = ProgressBar::new(folders.len() as u64);
     pb.set_style(
@@ -46,14 +89,31 @@ fn main() -> Result<()> {
     );
 
     // Initialize batch writers for memory-efficient parquet writing
-    let mut writers = batch_writer::DatasetWriters::new(Path::new(OUTPUT_DIR))?;
+    // Append mode: existing parquet files will have new data appended
+    let mut writers = batch_writer::DatasetWriters::new(&args.output_dir)?;
+
+    // Set up graceful shutdown
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown_requested.clone();
+    ctrlc::set_handler(move || {
+        println!("\n⏳ Ctrl+C received! Finishing current folder then stopping...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    }).expect("Error setting Ctrl+C handler");
 
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut interrupted = false;
 
     for folder in &folders {
+        // Check if shutdown was requested
+        if shutdown_requested.load(Ordering::SeqCst) {
+            pb.println("🛑 Stopping gracefully...");
+            interrupted = true;
+            break;
+        }
+
         pb.inc(1);
-        match process_folder_batch(folder, &mut writers) {
+        match process_folder_batch(folder, &mut writers, &assets_dir) {
             Ok(()) => success_count += 1,
             Err(e) => {
                 failure_count += 1;
@@ -82,6 +142,9 @@ fn main() -> Result<()> {
     println!("\n=== Results ===");
     println!("Success: {}", success_count);
     println!("Failed: {}", failure_count);
+    if interrupted {
+        println!("⚠ Run was interrupted by Ctrl+C");
+    }
 
     // Note: Round-trip verification is not available in batch mode
     // since data is written directly to parquet files.
@@ -288,10 +351,41 @@ struct StoryboardTriggerRow {
 
 // ============ Processing ============
 
+/// Read existing folder_ids from beatmaps.parquet
+fn read_existing_folder_ids(output_dir: &Path) -> HashSet<String> {
+    let beatmaps_path = output_dir.join("beatmaps.parquet");
+    if !beatmaps_path.exists() {
+        return HashSet::new();
+    }
+
+    let mut folder_ids = HashSet::new();
+    
+    if let Ok(file) = File::open(&beatmaps_path) {
+        if let Ok(reader) = ParquetRecordBatchReaderBuilder::try_new(file) {
+            if let Ok(reader) = reader.build() {
+                for batch in reader.flatten() {
+                    if let Some(col) = batch.column_by_name("folder_id") {
+                        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) {
+                                    folder_ids.insert(arr.value(i).to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    folder_ids
+}
+
 /// Batch version of process_folder that writes directly to parquet writers
 fn process_folder_batch(
     source_folder: &Path,
     writers: &mut batch_writer::DatasetWriters,
+    assets_dir: &Path,
 ) -> Result<()> {
     let folder_id = source_folder
         .file_name()
@@ -299,7 +393,7 @@ fn process_folder_batch(
         .to_string_lossy()
         .to_string();
 
-    let assets_folder = Path::new(ASSETS_DIR).join(&folder_id);
+    let assets_folder = assets_dir.join(&folder_id);
     let mut assets: HashSet<String> = HashSet::new();
 
     // Find all .osu files

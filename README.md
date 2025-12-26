@@ -17,7 +17,7 @@ A Rust toolkit for building comprehensive parquet datasets from osu! beatmaps.
 ## Quick Start
 
 ```powershell
-# 1. Extract .osz archives (auto-downloads from nerinyan if corrupt)
+# 1. Extract .osz archives
 cargo run --release --manifest-path osz-extractor/Cargo.toml
 
 # 2. Build parquet dataset from .osu files  
@@ -27,12 +27,50 @@ cargo run --release --manifest-path osu-dataset-builder/Cargo.toml
 cargo run --release --manifest-path osu-enricher/Cargo.toml
 ```
 
+## Incremental Updates
+
+All tools support incremental updates - they skip already-processed items by default.
+Use `--force` to reprocess everything:
+
+```powershell
+# Skip already-extracted archives (default)
+osz-extractor.exe
+
+# Force re-extraction of all archives
+osz-extractor.exe --force
+
+# Skip already-processed folders (default)
+osu-dataset-builder.exe
+
+# Force rebuild entire dataset
+osu-dataset-builder.exe --force
+
+# Skip already-enriched beatmaps (default)
+osu-enricher.exe
+
+# Force re-fetch all API data
+osu-enricher.exe --force
+```
+
+## Custom Paths
+
+```powershell
+# osz-extractor
+osz-extractor.exe --input-dir E:\archives --output-dir E:\extracted
+
+# osu-dataset-builder  
+osu-dataset-builder.exe --input-dir E:\extracted --output-dir E:\dataset
+
+# osu-enricher
+osu-enricher.exe --dataset-dir E:\dataset --source-dir E:\extracted --credentials E:\creds.txt
+```
+
 ## Directories
 
 | Path | Purpose |
 |------|---------|
 | `osu_archives/` | Input .osz files |
-| `osz_extracted/` | Extracted beatmap folders |
+| `osu_archives_extracted/` | Extracted beatmap folders |
 | `dataset/` | Output parquet files |
 
 ## Output Files
@@ -58,11 +96,6 @@ Requires `osu_credentials.txt` with:
 <client_secret>
 ```
 Get credentials from https://osu.ppy.sh/home/account/edit#oauth
-
-### Custom Paths
-```powershell
-osu-enricher.exe --dataset-dir E:\dataset --source-dir E:\extracted --credentials E:\creds.txt
-```
 
 ## Schema
 

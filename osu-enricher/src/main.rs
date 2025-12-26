@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Enrich beatmap data with osu! API metadata and PP calculations
@@ -31,12 +32,16 @@ struct Args {
     dataset_dir: PathBuf,
 
     /// Path to source directory containing extracted .osu files
-    #[arg(long, default_value = r"E:\osu_model\osz_extracted")]
+    #[arg(long, default_value = r"E:\osu_model\osu_archives_extracted")]
     source_dir: PathBuf,
 
     /// Path to credentials file (first line: client_id, second line: client_secret)
     #[arg(long, default_value = r"E:\osu_model\osu_credentials.txt")]
     credentials: PathBuf,
+
+    /// Force re-enrichment even if beatmap already exists in output
+    #[arg(long, short)]
+    force: bool,
 }
 
 fn read_credentials(path: &Path) -> Result<(u64, String)> {
@@ -188,13 +193,32 @@ async fn main() -> Result<()> {
 
     // Read existing beatmap IDs from dataset
     println!("Reading existing beatmap IDs from dataset...");
-    let beatmap_ids = read_beatmap_ids(&args.dataset_dir)?;
-    println!("Found {} beatmaps with valid IDs", beatmap_ids.len());
+    let all_beatmap_ids = read_beatmap_ids(&args.dataset_dir)?;
+    println!("Found {} beatmaps with valid IDs", all_beatmap_ids.len());
+
+    // Read already-enriched beatmap IDs (unless --force)
+    let existing_enriched: HashSet<u32> = if !args.force {
+        read_existing_enriched_ids(&args.dataset_dir)
+    } else {
+        HashSet::new()
+    };
+
+    // Filter out already-enriched beatmaps
+    let beatmap_ids: Vec<_> = all_beatmap_ids
+        .into_iter()
+        .filter(|(id, _, _)| !existing_enriched.contains(id))
+        .collect();
+
+    if !existing_enriched.is_empty() {
+        println!("Skipping {} already enriched beatmaps (use --force to re-fetch)", existing_enriched.len());
+    }
 
     if beatmap_ids.is_empty() {
-        println!("No beatmap IDs found. Exiting.");
+        println!("No new beatmap IDs to enrich. Exiting.");
         return Ok(());
     }
+
+    println!("Enriching {} new beatmaps", beatmap_ids.len());
 
     // Collect unique beatmapset IDs for comments
     let mut beatmapset_ids: HashSet<u32> = HashSet::new();
@@ -206,6 +230,16 @@ async fn main() -> Result<()> {
     let mut beatmap_rows: Vec<BeatmapRow> = Vec::new();
     let mut comment_rows: Vec<CommentRow> = Vec::new();
 
+    // Set up graceful shutdown
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown_requested.clone();
+    ctrlc::set_handler(move || {
+        println!("\n⏳ Ctrl+C received! Finishing current request then stopping...");
+        shutdown_clone.store(true, Ordering::SeqCst);
+    }).expect("Error setting Ctrl+C handler");
+
+    let mut interrupted = false;
+
     let pb = ProgressBar::new(beatmap_ids.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -216,6 +250,13 @@ async fn main() -> Result<()> {
 
     // Fetch metadata for each beatmap
     for (beatmap_id, folder_id, osu_file) in &beatmap_ids {
+        // Check if shutdown was requested
+        if shutdown_requested.load(Ordering::SeqCst) {
+            pb.println("🛑 Stopping gracefully...");
+            interrupted = true;
+            break;
+        }
+
         pb.set_message(format!("Fetching {}", beatmap_id));
         
         // Rate limit
@@ -291,9 +332,31 @@ async fn main() -> Result<()> {
 
     pb.finish_with_message("Beatmap fetching complete");
 
+    // Get ALL beatmapset_ids from enriched data (including previous runs)
+    // Combined with beatmapset_ids from this run
+    let all_enriched_beatmapset_ids = read_all_enriched_beatmapset_ids(&args.dataset_dir);
+    let all_beatmapset_ids: HashSet<u32> = all_enriched_beatmapset_ids.union(&beatmapset_ids).copied().collect();
+    
+    // Read already-commented beatmapset_ids (unless --force)
+    let existing_commented: HashSet<u32> = if !args.force {
+        read_existing_commented_beatmapset_ids(&args.dataset_dir)
+    } else {
+        HashSet::new()
+    };
+    
+    // Filter to only new beatmapset_ids
+    let new_beatmapset_ids: Vec<u32> = all_beatmapset_ids
+        .into_iter()
+        .filter(|id| !existing_commented.contains(id))
+        .collect();
+    
+    if !existing_commented.is_empty() {
+        println!("Skipping {} already-commented beatmapsets", existing_commented.len());
+    }
+
     // Fetch comments for each beatmapset
-    println!("\nFetching comments for {} beatmapsets...", beatmapset_ids.len());
-    let pb2 = ProgressBar::new(beatmapset_ids.len() as u64);
+    println!("Fetching comments for {} new beatmapsets...", new_beatmapset_ids.len());
+    let pb2 = ProgressBar::new(new_beatmapset_ids.len() as u64);
     pb2.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
@@ -301,7 +364,13 @@ async fn main() -> Result<()> {
             .progress_chars("#>-"),
     );
 
-    for beatmapset_id in &beatmapset_ids {
+    for beatmapset_id in &new_beatmapset_ids {
+        // Check if shutdown was requested
+        if shutdown_requested.load(Ordering::SeqCst) {
+            pb2.println("🛑 Stopping gracefully...");
+            break;
+        }
+
         rate_limiter.until_ready().await;
 
         match osu
@@ -362,19 +431,23 @@ async fn main() -> Result<()> {
     pb2.finish_with_message("Comment fetching complete");
 
     // Write parquet files
-    println!("\nWriting parquet files...");
+    println!("\n=== Writing Parquet Files ===");
     
     if !beatmap_rows.is_empty() {
-        write_enriched_parquet(&enriched_path, &beatmap_rows)?;
-        println!("  beatmap_enriched.parquet: {} rows", beatmap_rows.len());
+        let total = write_enriched_parquet(&enriched_path, &beatmap_rows)?;
+        println!("  beatmap_enriched.parquet: {} rows", total);
     }
 
     if !comment_rows.is_empty() {
-        write_comments_parquet(&comments_path, &comment_rows)?;
-        println!("  beatmap_comments.parquet: {} rows", comment_rows.len());
+        let total = write_comments_parquet(&comments_path, &comment_rows)?;
+        println!("  beatmap_comments.parquet: {} rows", total);
     }
 
-    println!("\nEnrichment complete!");
+    if interrupted {
+        println!("\n⚠ Run was interrupted by Ctrl+C");
+    } else {
+        println!("\nEnrichment complete!");
+    }
     Ok(())
 }
 
@@ -441,6 +514,96 @@ fn calculate_difficulty(osu_path: &Path, row: &mut BeatmapRow) -> Result<()> {
 }
 
 // ============ Parquet Reading ============
+
+/// Read existing enriched beatmap_ids from beatmap_enriched.parquet
+fn read_existing_enriched_ids(dataset_dir: &Path) -> HashSet<u32> {
+    let enriched_path = dataset_dir.join("beatmap_enriched.parquet");
+    if !enriched_path.exists() {
+        return HashSet::new();
+    }
+
+    let mut ids = HashSet::new();
+    
+    if let Ok(file) = File::open(&enriched_path) {
+        if let Ok(reader) = ParquetRecordBatchReaderBuilder::try_new(file) {
+            if let Ok(reader) = reader.build() {
+                for batch in reader.flatten() {
+                    if let Some(col) = batch.column_by_name("beatmap_id") {
+                        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) {
+                                    ids.insert(arr.value(i));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ids
+}
+
+/// Read existing commented beatmapset_ids from beatmap_comments.parquet
+fn read_existing_commented_beatmapset_ids(dataset_dir: &Path) -> HashSet<u32> {
+    let comments_path = dataset_dir.join("beatmap_comments.parquet");
+    if !comments_path.exists() {
+        return HashSet::new();
+    }
+
+    let mut ids = HashSet::new();
+    
+    if let Ok(file) = File::open(&comments_path) {
+        if let Ok(reader) = ParquetRecordBatchReaderBuilder::try_new(file) {
+            if let Ok(reader) = reader.build() {
+                for batch in reader.flatten() {
+                    if let Some(col) = batch.column_by_name("beatmapset_id") {
+                        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) {
+                                    ids.insert(arr.value(i));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ids
+}
+
+/// Read all beatmapset_ids from beatmap_enriched.parquet
+fn read_all_enriched_beatmapset_ids(dataset_dir: &Path) -> HashSet<u32> {
+    let enriched_path = dataset_dir.join("beatmap_enriched.parquet");
+    if !enriched_path.exists() {
+        return HashSet::new();
+    }
+
+    let mut ids = HashSet::new();
+    
+    if let Ok(file) = File::open(&enriched_path) {
+        if let Ok(reader) = ParquetRecordBatchReaderBuilder::try_new(file) {
+            if let Ok(reader) = reader.build() {
+                for batch in reader.flatten() {
+                    if let Some(col) = batch.column_by_name("beatmapset_id") {
+                        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt32Array>() {
+                            for i in 0..arr.len() {
+                                if !arr.is_null(i) {
+                                    ids.insert(arr.value(i));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ids
+}
 
 fn read_beatmap_ids(dataset_dir: &Path) -> Result<Vec<(u32, String, String)>> {
     let beatmaps_path = dataset_dir.join("beatmaps.parquet");
@@ -580,16 +743,13 @@ fn enriched_schema() -> Arc<Schema> {
     ]))
 }
 
-fn write_enriched_parquet(path: &Path, rows: &[BeatmapRow]) -> Result<()> {
+/// Write enriched data to parquet, merging with existing file if present
+fn write_enriched_parquet(path: &Path, rows: &[BeatmapRow]) -> Result<usize> {
     let schema = enriched_schema();
-    let file = File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-
-    let batch = RecordBatch::try_new(
-        schema,
+    
+    // Build new batch from rows
+    let new_batch = RecordBatch::try_new(
+        schema.clone(),
         vec![
             // Identifiers
             Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.beatmap_id))),
@@ -670,14 +830,45 @@ fn write_enriched_parquet(path: &Path, rows: &[BeatmapRow]) -> Result<()> {
             Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_objects).collect::<Vec<_>>())),
             Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_hold_notes).collect::<Vec<_>>())),
             
-            // Common
+            // is_convert
             Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_convert).collect::<Vec<_>>())),
         ],
     )?;
+    
+    // Merge with existing file
+    merge_and_write_parquet(path, &new_batch, schema)
+}
 
-    writer.write(&batch)?;
+/// Merge new batch with existing parquet file and write result, returns total rows
+fn merge_and_write_parquet(path: &Path, new_batch: &RecordBatch, schema: Arc<Schema>) -> Result<usize> {
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    
+    // Read existing file if it exists
+    if path.exists() {
+        let file = File::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        for batch in reader {
+            all_batches.push(batch?);
+        }
+    }
+    
+    // Add new batch
+    all_batches.push(new_batch.clone());
+    
+    // Write merged result
+    let file = File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    
+    for batch in &all_batches {
+        writer.write(batch)?;
+    }
     writer.close()?;
-    Ok(())
+    
+    let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+    Ok(total_rows)
 }
 
 fn comments_schema() -> Arc<Schema> {
@@ -701,16 +892,12 @@ fn comments_schema() -> Arc<Schema> {
     ]))
 }
 
-fn write_comments_parquet(path: &Path, rows: &[CommentRow]) -> Result<()> {
+/// Write comments to parquet, merging with existing file if present
+fn write_comments_parquet(path: &Path, rows: &[CommentRow]) -> Result<usize> {
     let schema = comments_schema();
-    let file = File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-    let batch = RecordBatch::try_new(
-        schema,
+    let new_batch = RecordBatch::try_new(
+        schema.clone(),
         vec![
             Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.beatmapset_id))),
             Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.comment_id))),
@@ -731,7 +918,5 @@ fn write_comments_parquet(path: &Path, rows: &[CommentRow]) -> Result<()> {
         ],
     )?;
 
-    writer.write(&batch)?;
-    writer.close()?;
-    Ok(())
+    merge_and_write_parquet(path, &new_batch, schema)
 }

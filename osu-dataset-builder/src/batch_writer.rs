@@ -1,13 +1,16 @@
 //! Batch-wise parquet writers for memory-efficient data export
+//! 
+//! Writes new data to temp files, then merges with existing parquet on close.
 
 use anyhow::Result;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use std::fs::File;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -16,15 +19,69 @@ use crate::{
     BreakRow, ComboColorRow, HitSampleRow, StoryboardLoopRow, StoryboardTriggerRow,
 };
 
-const DEFAULT_BATCH_SIZE: usize = 100;
+const DEFAULT_BATCH_SIZE: usize = 10;
+
+/// Merge existing parquet file with new temp file, writing result to final path
+fn merge_parquet_files(existing_path: &Path, temp_path: &Path, schema: Arc<Schema>) -> Result<usize> {
+    let mut all_batches: Vec<RecordBatch> = Vec::new();
+    
+    // Read existing file if it exists
+    if existing_path.exists() {
+        let file = File::open(existing_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        for batch in reader {
+            all_batches.push(batch?);
+        }
+    }
+    
+    // Read temp file
+    if temp_path.exists() {
+        let file = File::open(temp_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        for batch in reader {
+            all_batches.push(batch?);
+        }
+    }
+    
+    // Count total rows
+    let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+    
+    if total_rows == 0 {
+        // No data - remove temp file if exists
+        let _ = fs::remove_file(temp_path);
+        return Ok(0);
+    }
+    
+    // Write merged result
+    let file = File::create(existing_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    
+    for batch in &all_batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    
+    // Remove temp file
+    let _ = fs::remove_file(temp_path);
+    
+    Ok(total_rows)
+}
 
 /// Generic batch writer for parquet files
+/// Writes to a temp file, then merges with existing data on close()
 pub struct BatchWriter<T, F: Fn(&[T]) -> Result<RecordBatch>> {
     writer: ArrowWriter<File>,
     buffer: Vec<T>,
     batch_size: usize,
     to_batch: F,
     total_rows: usize,
+    // For merge-on-close
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    schema: Arc<Schema>,
 }
 
 impl<T, F: Fn(&[T]) -> Result<RecordBatch>> BatchWriter<T, F> {
@@ -33,11 +90,13 @@ impl<T, F: Fn(&[T]) -> Result<RecordBatch>> BatchWriter<T, F> {
     }
 
     pub fn with_batch_size(path: &Path, schema: Arc<Schema>, to_batch: F, batch_size: usize) -> Result<Self> {
-        let file = File::create(path)?;
+        // Write to temp file, not the final path
+        let temp_path = path.with_extension("parquet.tmp");
+        let file = File::create(&temp_path)?;
         let props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
-        let writer = ArrowWriter::try_new(file, schema, Some(props))?;
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
         
         Ok(Self {
             writer,
@@ -45,6 +104,9 @@ impl<T, F: Fn(&[T]) -> Result<RecordBatch>> BatchWriter<T, F> {
             batch_size,
             to_batch,
             total_rows: 0,
+            final_path: path.to_path_buf(),
+            temp_path,
+            schema,
         })
     }
 
@@ -67,10 +129,14 @@ impl<T, F: Fn(&[T]) -> Result<RecordBatch>> BatchWriter<T, F> {
         Ok(())
     }
 
+    /// Close the writer and merge temp file with existing data
     pub fn close(mut self) -> Result<usize> {
         self.flush()?;
         self.writer.close()?;
-        Ok(self.total_rows)
+        
+        // Merge temp file with existing data
+        let total = merge_parquet_files(&self.final_path, &self.temp_path, self.schema)?;
+        Ok(total)
     }
 }
 

@@ -2,7 +2,7 @@
 name = "osz-extractor"
 version = "0.1.0"
 edition = "2021"
-description = "Extract and delete .osz files from osu! songs folder"
+description = "Extract .osz files from osu! songs folder"
 
 [dependencies]
 zip = "7.0"
@@ -13,4 +13,5 @@ ctrlc = "3.4"
 rayon = "1.10"
 infer = "0.19"
 reqwest = { version = "0.12", features = ["blocking"] }
+clap = { version = "4", features = ["derive"] }
 

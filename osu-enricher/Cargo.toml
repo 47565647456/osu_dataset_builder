@@ -36,3 +36,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Caching (simple file-based)
 directories = "6"
+
+# Graceful shutdown
+ctrlc = "3.4"
+

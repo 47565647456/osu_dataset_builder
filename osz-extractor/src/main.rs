@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -9,6 +10,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use zip::ZipArchive;
+
+/// Extract .osz files from osu! songs folder
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// Path to directory containing .osz files
+    #[arg(long, default_value = r"E:\osu_model\osu_archives")]
+    input_dir: PathBuf,
+
+    /// Path to output directory for extracted files
+    #[arg(long, default_value = r"E:\osu_model\osu_archives_extracted")]
+    output_dir: PathBuf,
+
+    /// Force re-extraction even if output folder exists
+    #[arg(long, short)]
+    force: bool,
+}
 
 /// Rate limiter state for nerinyan API (25 requests per minute)
 struct RateLimiter {
@@ -61,6 +79,8 @@ fn download_from_nerinyan(beatmapset_id: &str, dest_path: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
     // Set up graceful shutdown flag
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown_requested.clone();
@@ -71,22 +91,21 @@ fn main() -> Result<()> {
     })
     .expect("Error setting Ctrl+C handler");
 
-    // Default .osz archives path - adjust if needed
-    let songs_folder = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| r"E:\osu_model\osu_archives".to_string());
-
-    let songs_path = Path::new(&songs_folder);
-
-    if !songs_path.exists() {
-        anyhow::bail!("Songs folder does not exist: {}", songs_folder);
+    if !args.input_dir.exists() {
+        anyhow::bail!("Input folder does not exist: {}", args.input_dir.display());
     }
 
-    println!("Scanning for .osz files in: {}", songs_folder);
+    // Create output directory if it doesn't exist
+    fs::create_dir_all(&args.output_dir)?;
+
+    println!("Scanning for .osz files in: {}", args.input_dir.display());
+    if args.force {
+        println!("Force mode: will re-extract existing folders");
+    }
 
     // Collect all .osz files
-    let osz_files: Vec<PathBuf> = WalkDir::new(songs_path)
-        .max_depth(1) // Only look in the root of songs folder
+    let osz_files: Vec<PathBuf> = WalkDir::new(&args.input_dir)
+        .max_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -103,7 +122,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("Found {} .osz files to extract", osz_files.len());
+    println!("Found {} .osz files", osz_files.len());
     println!("Press Ctrl+C to stop gracefully (will finish current file)\n");
 
     let pb = ProgressBar::new(osz_files.len() as u64);
@@ -117,7 +136,31 @@ fn main() -> Result<()> {
     let mut extracted_count = 0;
     let mut failed_count = 0;
     let mut skipped_count = 0;
+    let mut already_extracted_count = 0;
     let mut downloaded_count = 0;
+    
+    // Load failed list (beatmapset IDs that permanently failed)
+    // Format: "id: reason" - we extract the ID for skip checks, store full line
+    let failed_list_path = args.output_dir.join("failed.txt");
+    let failed_lines: Vec<String> = if failed_list_path.exists() {
+        std::fs::read_to_string(&failed_list_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Extract just IDs for fast lookup
+    let failed_id_set: std::collections::HashSet<String> = failed_lines
+        .iter()
+        .map(|line| line.split(':').next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Keep full lines for saving (preserves reasons)
+    let mut failed_ids: std::collections::HashSet<String> = failed_lines.into_iter().collect();
+    let initial_failed_count = failed_id_set.len();
     
     // Rate limiter for nerinyan API (25 requests per minute)
     let mut rate_limiter = RateLimiter::new(25);
@@ -125,7 +168,7 @@ fn main() -> Result<()> {
     for osz_path in &osz_files {
         // Check if shutdown was requested before starting next file
         if shutdown_requested.load(Ordering::SeqCst) {
-            skipped_count = osz_files.len() - extracted_count - failed_count;
+            skipped_count = osz_files.len() - extracted_count - failed_count - already_extracted_count;
             pb.println("🛑 Stopping gracefully...");
             break;
         }
@@ -133,63 +176,80 @@ fn main() -> Result<()> {
         let osz_name = osz_path.file_name().unwrap_or_default().to_string_lossy();
         pb.set_message(format!("{}", osz_name));
 
+        // Get beatmapset ID for skip checks
+        let beatmapset_id = osz_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // Check if already known to be permanently failed
+        if failed_id_set.contains(beatmapset_id) {
+            skipped_count += 1;
+            pb.inc(1);
+            continue;
+        }
+
+        // Check if already extracted (unless --force)
+        let folder_name = osz_path.file_stem().unwrap_or_default().to_string_lossy();
+        let extract_folder = args.output_dir.join(folder_name.as_ref());
+        
+        if !args.force && extract_folder.exists() {
+            already_extracted_count += 1;
+            pb.inc(1);
+            continue;
+        }
+
+        let osz_name = osz_path.file_name().unwrap_or_default().to_string_lossy();
+        pb.set_message(format!("{}", osz_name));
+
         // Try to extract
-        match extract_and_delete_osz(osz_path, songs_path) {
+        match extract_osz(osz_path, &args.output_dir) {
             Ok(_) => {
                 extracted_count += 1;
             }
             Err(e) => {
-                let error_str = format!("{}", e);
-                
-                // Check if it's a zip read failure - try downloading from nerinyan
-                if error_str.contains("Failed to read zip") {
-                    // Extract beatmapset ID from filename (the numeric part)
-                    let beatmapset_id = osz_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
+                // Always try downloading from nerinyan on any failure
+                // Only if filename looks like a beatmapset ID (numeric)
+                if beatmapset_id.chars().all(|c| c.is_ascii_digit()) && !beatmapset_id.is_empty() {
+                    pb.println(format!("⬇️  {} - Downloading from nerinyan...", osz_name));
                     
-                    // Only try if the filename looks like a beatmapset ID
-                    if beatmapset_id.chars().all(|c| c.is_ascii_digit()) && !beatmapset_id.is_empty() {
-                        pb.println(format!("⬇️  {} - Downloading from nerinyan...", osz_name));
-                        
-                        // Rate limit
-                        rate_limiter.wait();
-                        
-                        // Download to a temp file
-                        let temp_path = osz_path.with_extension("osz.tmp");
-                        match download_from_nerinyan(beatmapset_id, &temp_path) {
-                            Ok(_) => {
-                                downloaded_count += 1;
-                                
-                                // Replace the corrupt file with the downloaded one
-                                if let Err(e) = fs::rename(&temp_path, osz_path) {
-                                    pb.println(format!("❌ {} - Failed to replace file: {}", osz_name, e));
-                                    let _ = fs::remove_file(&temp_path);
-                                    failed_count += 1;
-                                } else {
-                                    // Retry extraction with the new file
-                                    match extract_and_delete_osz(osz_path, songs_path) {
-                                        Ok(_) => {
-                                            pb.println(format!("✅ {} - Downloaded and extracted", osz_name));
-                                            extracted_count += 1;
-                                        }
-                                        Err(e) => {
-                                            pb.println(format!("❌ {} - Still failed after download: {}", osz_name, e));
-                                            failed_count += 1;
-                                        }
+                    // Rate limit
+                    rate_limiter.wait();
+                    
+                    // Download to a temp file
+                    let temp_path = osz_path.with_extension("osz.tmp");
+                    match download_from_nerinyan(beatmapset_id, &temp_path) {
+                        Ok(_) => {
+                            downloaded_count += 1;
+                            
+                            // Replace the corrupt file with the downloaded one
+                            if let Err(e) = fs::rename(&temp_path, osz_path) {
+                                pb.println(format!("❌ {} - Failed to replace file: {}", osz_name, e));
+                                let _ = fs::remove_file(&temp_path);
+                                failed_ids.insert(format!("{}: {}", beatmapset_id, e));
+                                failed_count += 1;
+                            } else {
+                                // Retry extraction with the new file
+                                match extract_osz(osz_path, &args.output_dir) {
+                                    Ok(_) => {
+                                        pb.println(format!("✅ {} - Downloaded and extracted", osz_name));
+                                        extracted_count += 1;
+                                    }
+                                    Err(e) => {
+                                        pb.println(format!("❌ {} - Still failed: {}", osz_name, e));
+                                        // Add to failed list with reason
+                                        failed_ids.insert(format!("{}: {}", beatmapset_id, e));
+                                        failed_count += 1;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                pb.println(format!("❌ {} - Download failed: {}", osz_name, e));
-                                let _ = fs::remove_file(&temp_path);
-                                failed_count += 1;
-                            }
                         }
-                    } else {
-                        pb.println(format!("❌ {} - {}", osz_name, e));
-                        failed_count += 1;
+                        Err(e) => {
+                            pb.println(format!("❌ {} - Download failed: {}", osz_name, e));
+                            let _ = fs::remove_file(&temp_path);
+                            failed_ids.insert(format!("{}: {}", beatmapset_id, e));
+                            failed_count += 1;
+                        }
                     }
                 } else {
                     pb.println(format!("❌ {} - {}", osz_name, e));
@@ -203,12 +263,26 @@ fn main() -> Result<()> {
 
     pb.finish_and_clear();
 
+    // Save failed list if there are new failures
+    let new_failures = failed_ids.len() - initial_failed_count;
+    if new_failures > 0 {
+        let content: String = failed_ids.iter().map(|s| format!("{}\n", s)).collect();
+        let _ = std::fs::write(&failed_list_path, content);
+    }
+
     println!("\n✅ Summary:");
     println!("   Extracted:  {}", extracted_count);
+    println!("   Skipped:    {} (already extracted)", already_extracted_count);
+    if initial_failed_count > 0 {
+        println!("   Skipped:    {} (permanently failed)", initial_failed_count);
+    }
     println!("   Downloaded: {}", downloaded_count);
     println!("   Failed:     {}", failed_count);
+    if new_failures > 0 {
+        println!("   Added to failed.txt: {}", new_failures);
+    }
     if skipped_count > 0 {
-        println!("   Skipped:    {} (due to Ctrl+C)", skipped_count);
+        println!("   Interrupted: {} (due to Ctrl+C)", skipped_count);
     }
 
     Ok(())
@@ -219,21 +293,6 @@ fn is_audio_content(data: &[u8]) -> bool {
     infer::get(data)
         .map(|kind| kind.matcher_type() == infer::MatcherType::Audio)
         .unwrap_or(false)
-}
-
-/// Check if path has audio file extension
-fn is_audio_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(ext.to_lowercase().as_str(), 
-                "mp3" | "ogg" | "wav" | "flac" | "m4a" | "wma")
-        })
-}
-
-/// Combined audio check: magic bytes OR extension
-fn is_audio(path: &Path, data: &[u8]) -> bool {
-    is_audio_content(data) || is_audio_extension(path)
 }
 
 /// Check if a path has .osu extension
@@ -317,8 +376,7 @@ fn parse_images_from_osu(content: &str) -> OsuImageRefs {
     refs
 }
 
-fn extract_and_delete_osz(osz_path: &Path, songs_folder: &Path) -> Result<()> {
-    use std::collections::HashSet;
+fn extract_osz(osz_path: &Path, output_dir: &Path) -> Result<()> {
     
     // Get the filename without extension to use as folder name
     let folder_name = osz_path
@@ -326,14 +384,27 @@ fn extract_and_delete_osz(osz_path: &Path, songs_folder: &Path) -> Result<()> {
         .context("Failed to get file stem")?
         .to_string_lossy();
 
-    // Extract to osu_archives_extracted folder in the parent (root) directory
-    let root_folder = songs_folder.parent().unwrap_or(songs_folder);
-    let extract_folder = root_folder.join("osu_archives_extracted").join(folder_name.as_ref());
+    // Extract to output_dir/{folder_name}
+    let extract_folder = output_dir.join(folder_name.as_ref());
 
     // Create the extraction folder
     fs::create_dir_all(&extract_folder)
         .with_context(|| format!("Failed to create folder: {}", extract_folder.display()))?;
 
+    // Run extraction - if it fails, clean up the folder
+    let result = extract_osz_inner(osz_path, &extract_folder);
+    
+    if result.is_err() {
+        // Clean up empty or partial folder on failure
+        let _ = fs::remove_dir_all(&extract_folder);
+    }
+    
+    result
+}
+
+fn extract_osz_inner(osz_path: &Path, extract_folder: &Path) -> Result<()> {
+    use std::collections::HashSet;
+    
     // Open the .osz file (which is just a zip archive)
     let file = File::open(osz_path)
         .with_context(|| format!("Failed to open: {}", osz_path.display()))?;
@@ -389,55 +460,47 @@ fn extract_and_delete_osz(osz_path: &Path, songs_folder: &Path) -> Result<()> {
 
     // Validate: must have at least one .osu file
     if !has_osu_files {
-        anyhow::bail!("No .osu files found in archive");
+        anyhow::bail!("No .osu files found");
     }
 
-    // Note: Background images are optional (some maps use videos or plain colors)
-
-    // Build a set of normalized archive paths for lookup (case-insensitive)
-    let archive_paths: HashSet<String> = files_data
+    // Build set of available files (lowercased for case-insensitive matching)
+    let available_files: HashSet<String> = files_data
         .iter()
         .map(|(path, _)| normalize_path(&path.to_string_lossy()))
         .collect();
 
-    // Log missing backgrounds (optional but useful to know)
-    let osz_name = osz_path.file_name().unwrap_or_default().to_string_lossy();
+    // Check that all required backgrounds exist
     for bg in &required_backgrounds {
-        if !archive_paths.contains(bg) {
-            eprintln!("  ⚠ {} - Background not found: {}", osz_name, bg);
+        if !available_files.contains(bg) {
+            anyhow::bail!("Required background not found: {}", bg);
         }
     }
 
-    // Log missing storyboard images
-    for img in &optional_images {
-        if !archive_paths.contains(img) {
-            eprintln!("  ⚠ {} - Storyboard image not found: {}", osz_name, img);
-        }
-    }
-
-    // Filter to only images that actually exist in the archive (case-insensitive)
-    let all_images: HashSet<String> = required_backgrounds
-        .union(&optional_images)
-        .filter(|img| archive_paths.contains(*img))
-        .cloned()
-        .collect();
-
-    // Validate: must have at least one audio file
-    let has_audio = files_data.iter().any(|(path, data)| is_audio(path, data));
-    if !has_audio {
-        anyhow::bail!("No audio files found in archive");
-    }
-
-    // Third pass: write only essential files (audio, .osu, referenced images that exist)
-    for (inner_path, data) in files_data {
+    // Third pass: extract files
+    let mut audio_found = false;
+    
+    for (inner_path, data) in &files_data {
         let normalized = normalize_path(&inner_path.to_string_lossy());
         
-        let should_extract = is_osu_file(&inner_path) 
-            || is_osb_file(&inner_path)
-            || is_audio(&inner_path, &data)
-            || all_images.contains(&normalized);
+        // Always keep: .osu files, .osb files
+        let keep = is_osu_file(inner_path) 
+            || is_osb_file(inner_path)
+            || is_audio_content(data) 
+            || required_backgrounds.contains(&normalized)
+            || optional_images.contains(&normalized);
 
-        if !should_extract {
+        if !keep {
+            continue;
+        }
+
+        // Track if we found audio
+        if is_audio_content(data) {
+            audio_found = true;
+        }
+
+        // Warn about missing optional storyboard images
+        if optional_images.contains(&normalized) && !available_files.contains(&normalized) {
+            eprintln!("⚠ Storyboard image not found: {}", inner_path.display());
             continue;
         }
 
@@ -452,6 +515,11 @@ fn extract_and_delete_osz(osz_path: &Path, songs_folder: &Path) -> Result<()> {
             .with_context(|| format!("Failed to create file: {}", outpath.display()))?;
 
         io::Write::write_all(&mut outfile, &data)?;
+    }
+
+    // Validate: must have audio
+    if !audio_found {
+        anyhow::bail!("No audio file found");
     }
 
     // Delete the original .osz file after successful extraction
