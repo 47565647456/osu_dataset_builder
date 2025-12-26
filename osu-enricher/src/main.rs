@@ -4,19 +4,17 @@
 //! and writes enriched data to new parquet files.
 
 mod batch_writer;
+mod clients;
 
 use anyhow::{Context, Result};
 use arrow::array::*;
 use clap::Parser;
-use governor::{Quota, RateLimiter};
 use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rosu_pp::{Beatmap as PpBeatmap, Difficulty, Performance};
-use rosu_v2::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -42,28 +40,34 @@ struct Args {
     force: bool,
 }
 
-fn read_credentials(path: &Path) -> Result<(u64, String)> {
+fn read_credentials(path: &Path) -> Result<Vec<(u64, String)>> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open credentials file: {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
     
-    let client_id = lines
-        .next()
-        .context("Credentials file is empty")?
-        .context("Failed to read client_id line")?
-        .trim()
-        .parse::<u64>()
-        .context("client_id must be a number")?;
+    let mut credentials = Vec::new();
     
-    let client_secret = lines
-        .next()
-        .context("Credentials file missing client_secret")?
-        .context("Failed to read client_secret line")?
-        .trim()
-        .to_string();
+    while let Some(line1) = lines.next() {
+        let client_id_str = line1.context("Failed to read client_id line")?;
+        let client_id = client_id_str.trim().parse::<u64>()
+            .context("client_id must be a number")?;
+            
+        let client_secret = lines
+            .next()
+            .context("Credentials file missing client_secret for a client_id")?
+            .context("Failed to read client_secret line")?
+            .trim()
+            .to_string();
+            
+        credentials.push((client_id, client_secret));
+    }
     
-    Ok((client_id, client_secret))
+    if credentials.is_empty() {
+        anyhow::bail!("Credentials file is empty");
+    }
+    
+    Ok(credentials)
 }
 
 // ============ Data Structures ============
@@ -184,13 +188,10 @@ async fn main() -> Result<()> {
 
     // Load API credentials from file
     println!("Reading credentials from {}...", args.credentials.display());
-    let (client_id, client_secret) = read_credentials(&args.credentials)?;
+    let credentials = read_credentials(&args.credentials)?;
 
-    println!("Initializing osu! API client...");
-    let osu = Osu::new(client_id, client_secret).await?;
-
-    // Rate limiter: 120 requests per minute
-    let rate_limiter = RateLimiter::direct(Quota::per_minute(NonZeroU32::new(120).unwrap()));
+    println!("Initializing {} osu! API clients...", credentials.len());
+    let pool = clients::OsuClientPool::new(credentials).await?;
 
     // Read existing beatmap IDs from dataset
     println!("Reading existing beatmap IDs from dataset...");
@@ -283,8 +284,11 @@ async fn main() -> Result<()> {
 
         pb.set_message(format!("Fetching {}", beatmap_id));
         
+        // Get next client from pool
+        let osu_client = pool.get_next();
+        
         // Rate limit
-        rate_limiter.until_ready().await;
+        osu_client.rate_limiter.until_ready().await;
 
         let mut row = BeatmapRow {
             beatmap_id: *beatmap_id,
@@ -294,7 +298,7 @@ async fn main() -> Result<()> {
         };
 
         // Fetch from API
-        match osu.beatmap().map_id(*beatmap_id).await {
+        match osu_client.client.beatmap().map_id(*beatmap_id).await {
             Ok(beatmap) => {
                 beatmapset_ids.insert(beatmap.mapset_id);
                 
@@ -401,9 +405,12 @@ async fn main() -> Result<()> {
             break;
         }
 
-        rate_limiter.until_ready().await;
+        // Get next client from pool
+        let osu_client = pool.get_next();
 
-        match osu
+        osu_client.rate_limiter.until_ready().await;
+
+        match osu_client.client
             .comments()
             .commentable_type("beatmapset")
             .commentable_id(*beatmapset_id)

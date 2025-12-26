@@ -40,3 +40,6 @@ directories = "6"
 # Graceful shutdown
 ctrlc = "3.4"
 
+# Concurrency
+futures = "0.3"
+
