@@ -51,8 +51,31 @@ fn main() -> Result<()> {
         HashSet::new()
     };
 
+    // Load failed folders list (format: "folder_name: reason")
+    let failed_path = args.output_dir.join("failed_folders.txt");
+    let failed_lines: Vec<String> = if failed_path.exists() {
+        std::fs::read_to_string(&failed_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let failed_folder_set: HashSet<String> = failed_lines
+        .iter()
+        .map(|line| line.split(':').next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut failed_folders: HashSet<String> = failed_lines.into_iter().collect();
+    let initial_failed_count = failed_folder_set.len();
+
     if !existing_folder_ids.is_empty() {
         println!("Found {} already processed folders (use --force to rebuild)", existing_folder_ids.len());
+    }
+    if initial_failed_count > 0 {
+        println!("Skipping {} permanently failed folders", initial_failed_count);
     }
 
     let mut folders: Vec<PathBuf> = fs::read_dir(&args.input_dir)?
@@ -60,9 +83,9 @@ fn main() -> Result<()> {
         .filter(|e| e.path().is_dir())
         .map(|e| e.path())
         .filter(|p| {
-            // Skip already processed folders
+            // Skip already processed and failed folders
             let folder_name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            !existing_folder_ids.contains(&folder_name)
+            !existing_folder_ids.contains(&folder_name) && !failed_folder_set.contains(&folder_name)
         })
         .collect();
 
@@ -117,6 +140,8 @@ fn main() -> Result<()> {
             Ok(()) => success_count += 1,
             Err(e) => {
                 failure_count += 1;
+                let folder_name = folder.file_name().unwrap_or_default().to_string_lossy().to_string();
+                failed_folders.insert(format!("{}: {}", folder_name, e));
                 pb.println(format!("Error: {}: {}", folder.display(), e));
             }
         }
@@ -144,6 +169,14 @@ fn main() -> Result<()> {
     println!("Failed: {}", failure_count);
     if interrupted {
         println!("⚠ Run was interrupted by Ctrl+C");
+    }
+
+    // Save failed list if there are new failures
+    let new_failures = failed_folders.len() - initial_failed_count;
+    if new_failures > 0 {
+        let content: String = failed_folders.iter().map(|s| format!("{}\n", s)).collect();
+        let _ = std::fs::write(&failed_path, content);
+        println!("Added {} folders to failed_folders.txt", new_failures);
     }
 
     // Note: Round-trip verification is not available in batch mode

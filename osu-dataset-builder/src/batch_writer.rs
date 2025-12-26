@@ -19,7 +19,7 @@ use crate::{
     BreakRow, ComboColorRow, HitSampleRow, StoryboardLoopRow, StoryboardTriggerRow,
 };
 
-const DEFAULT_BATCH_SIZE: usize = 10;
+const DEFAULT_BATCH_SIZE: usize = 1000;
 
 /// Merge existing parquet file with new temp file, writing result to final path
 fn merge_parquet_files(existing_path: &Path, temp_path: &Path, schema: Arc<Schema>) -> Result<usize> {
@@ -130,9 +130,23 @@ impl<T, F: Fn(&[T]) -> Result<RecordBatch>> BatchWriter<T, F> {
     }
 
     /// Close the writer and merge temp file with existing data
+    /// Skips merge if no new data was written
     pub fn close(mut self) -> Result<usize> {
         self.flush()?;
         self.writer.close()?;
+        
+        // If no new rows, just clean up temp file and return existing count
+        if self.total_rows == 0 {
+            let _ = fs::remove_file(&self.temp_path);
+            // Count existing rows if file exists
+            if self.final_path.exists() {
+                let file = File::open(&self.final_path)?;
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+                let count: usize = reader.map(|b| b.map(|b| b.num_rows()).unwrap_or(0)).sum();
+                return Ok(count);
+            }
+            return Ok(0);
+        }
         
         // Merge temp file with existing data
         let total = merge_parquet_files(&self.final_path, &self.temp_path, self.schema)?;

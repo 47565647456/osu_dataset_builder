@@ -3,16 +3,14 @@
 //! Reads beatmap_ids from existing dataset, fetches API data, calculates PP,
 //! and writes enriched data to new parquet files.
 
+mod batch_writer;
+
 use anyhow::{Context, Result};
 use arrow::array::*;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use governor::{Quota, RateLimiter};
 use indicatif::{ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use rosu_pp::{Beatmap as PpBeatmap, Difficulty, Performance};
 use rosu_v2::prelude::*;
 use std::collections::HashSet;
@@ -188,8 +186,8 @@ async fn main() -> Result<()> {
     println!("Initializing osu! API client...");
     let osu = Osu::new(client_id, client_secret).await?;
 
-    // Rate limiter: 60 requests per minute
-    let rate_limiter = RateLimiter::direct(Quota::per_minute(NonZeroU32::new(60).unwrap()));
+    // Rate limiter: 120 requests per minute
+    let rate_limiter = RateLimiter::direct(Quota::per_minute(NonZeroU32::new(120).unwrap()));
 
     // Read existing beatmap IDs from dataset
     println!("Reading existing beatmap IDs from dataset...");
@@ -203,14 +201,36 @@ async fn main() -> Result<()> {
         HashSet::new()
     };
 
-    // Filter out already-enriched beatmaps
+    // Load failed beatmaps list (format: "id: reason")
+    let failed_path = args.dataset_dir.join("failed_beatmaps.txt");
+    let failed_lines: Vec<String> = if failed_path.exists() {
+        std::fs::read_to_string(&failed_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let failed_id_set: HashSet<u32> = failed_lines
+        .iter()
+        .filter_map(|line| line.split(':').next()?.trim().parse().ok())
+        .collect();
+    let mut failed_ids: HashSet<String> = failed_lines.into_iter().collect();
+    let initial_failed_count = failed_id_set.len();
+
+    // Filter out already-enriched and failed beatmaps
     let beatmap_ids: Vec<_> = all_beatmap_ids
         .into_iter()
-        .filter(|(id, _, _)| !existing_enriched.contains(id))
+        .filter(|(id, _, _)| !existing_enriched.contains(id) && !failed_id_set.contains(id))
         .collect();
 
     if !existing_enriched.is_empty() {
         println!("Skipping {} already enriched beatmaps (use --force to re-fetch)", existing_enriched.len());
+    }
+    if initial_failed_count > 0 {
+        println!("Skipping {} permanently failed beatmaps", initial_failed_count);
     }
 
     if beatmap_ids.is_empty() {
@@ -227,8 +247,9 @@ async fn main() -> Result<()> {
     let enriched_path = args.dataset_dir.join("beatmap_enriched.parquet");
     let comments_path = args.dataset_dir.join("beatmap_comments.parquet");
 
-    let mut beatmap_rows: Vec<BeatmapRow> = Vec::new();
-    let mut comment_rows: Vec<CommentRow> = Vec::new();
+    // Initialize batch writers for streaming output
+    let mut enriched_writer = batch_writer::EnrichedBatchWriter::new(&enriched_path)?;
+    let mut comments_writer = batch_writer::CommentsBatchWriter::new(&comments_path)?;
 
     // Set up graceful shutdown
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -311,6 +332,11 @@ async fn main() -> Result<()> {
                 row.last_updated = Some(beatmap.last_updated.unix_timestamp());
             }
             Err(e) => {
+                let error_str = format!("{}", e);
+                // Track 404s and other permanent errors
+                if error_str.contains("404") || error_str.contains("missing") {
+                    failed_ids.insert(format!("{}: {}", beatmap_id, e));
+                }
                 pb.println(format!("⚠ Failed to fetch API data for {}: {}", beatmap_id, e));
             }
         }
@@ -326,7 +352,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        beatmap_rows.push(row);
+        enriched_writer.write(row)?;
         pb.inc(1);
     }
 
@@ -402,12 +428,12 @@ async fn main() -> Result<()> {
 
                 // Add main comments
                 for comment in &bundle.comments {
-                    comment_rows.push(to_row(comment, *beatmapset_id));
+                    comments_writer.write(to_row(comment, *beatmapset_id))?;
                 }
 
                 // Add included comments (replies, parents)
                 for comment in &bundle.included_comments {
-                    comment_rows.push(to_row(comment, *beatmapset_id));
+                    comments_writer.write(to_row(comment, *beatmapset_id))?;
                 }
 
                 // Add pinned comments if present
@@ -415,7 +441,7 @@ async fn main() -> Result<()> {
                     for comment in pinned {
                         // Only add if not already in comments
                         if !bundle.comments.iter().any(|c| c.comment_id == comment.comment_id) {
-                            comment_rows.push(to_row(comment, *beatmapset_id));
+                            comments_writer.write(to_row(comment, *beatmapset_id))?;
                         }
                     }
                 }
@@ -430,17 +456,20 @@ async fn main() -> Result<()> {
 
     pb2.finish_with_message("Comment fetching complete");
 
-    // Write parquet files
+    // Close batch writers and get totals (handles merge automatically)
     println!("\n=== Writing Parquet Files ===");
+    let enriched_total = enriched_writer.close()?;
+    println!("  beatmap_enriched.parquet: {} rows", enriched_total);
     
-    if !beatmap_rows.is_empty() {
-        let total = write_enriched_parquet(&enriched_path, &beatmap_rows)?;
-        println!("  beatmap_enriched.parquet: {} rows", total);
-    }
+    let comments_total = comments_writer.close()?;
+    println!("  beatmap_comments.parquet: {} rows", comments_total);
 
-    if !comment_rows.is_empty() {
-        let total = write_comments_parquet(&comments_path, &comment_rows)?;
-        println!("  beatmap_comments.parquet: {} rows", total);
+    // Save failed list if there are new failures
+    let new_failures = failed_ids.len() - initial_failed_count;
+    if new_failures > 0 {
+        let content: String = failed_ids.iter().map(|s| format!("{}\n", s)).collect();
+        let _ = std::fs::write(&failed_path, content);
+        println!("Added {} beatmaps to failed_beatmaps.txt", new_failures);
     }
 
     if interrupted {
@@ -653,270 +682,4 @@ fn read_beatmap_ids(dataset_dir: &Path) -> Result<Vec<(u32, String, String)>> {
     }
 
     Ok(results)
-}
-
-// ============ Parquet Writers ============
-
-fn enriched_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        // Identifiers
-        Field::new("beatmap_id", DataType::UInt32, false),
-        Field::new("beatmapset_id", DataType::UInt32, false),
-        Field::new("folder_id", DataType::Utf8, false),
-        Field::new("osu_file", DataType::Utf8, false),
-        
-        // API Metadata
-        Field::new("mode", DataType::Utf8, false),
-        Field::new("version", DataType::Utf8, false),
-        Field::new("url", DataType::Utf8, false),
-        Field::new("status", DataType::Utf8, false),
-        Field::new("is_scoreable", DataType::Boolean, false),
-        Field::new("convert", DataType::Boolean, false),
-        
-        // Difficulty settings
-        Field::new("ar", DataType::Float32, false),
-        Field::new("cs", DataType::Float32, false),
-        Field::new("od", DataType::Float32, false),
-        Field::new("hp", DataType::Float32, false),
-        Field::new("bpm", DataType::Float32, false),
-        
-        // Counts
-        Field::new("count_circles", DataType::UInt32, false),
-        Field::new("count_sliders", DataType::UInt32, false),
-        Field::new("count_spinners", DataType::UInt32, false),
-        
-        // Length
-        Field::new("seconds_drain", DataType::UInt32, false),
-        Field::new("seconds_total", DataType::UInt32, false),
-        
-        // Stats
-        Field::new("playcount", DataType::UInt32, false),
-        Field::new("passcount", DataType::UInt32, false),
-        Field::new("max_combo_api", DataType::UInt32, true),
-        Field::new("stars_api", DataType::Float32, false),
-        
-        // Other
-        Field::new("checksum", DataType::Utf8, false),
-        Field::new("creator_id", DataType::UInt32, false),
-        Field::new("last_updated", DataType::Int64, true),
-        
-        // PP Calculation
-        Field::new("stars_calc", DataType::Float64, false),
-        Field::new("max_pp", DataType::Float64, false),
-        Field::new("max_combo_calc", DataType::UInt32, false),
-        
-        // osu! specific
-        Field::new("osu_aim", DataType::Float64, true),
-        Field::new("osu_speed", DataType::Float64, true),
-        Field::new("osu_flashlight", DataType::Float64, true),
-        Field::new("osu_slider_factor", DataType::Float64, true),
-        Field::new("osu_speed_note_count", DataType::Float64, true),
-        Field::new("osu_aim_difficult_slider_count", DataType::Float64, true),
-        Field::new("osu_aim_difficult_strain_count", DataType::Float64, true),
-        Field::new("osu_speed_difficult_strain_count", DataType::Float64, true),
-        Field::new("osu_great_hit_window", DataType::Float64, true),
-        Field::new("osu_ok_hit_window", DataType::Float64, true),
-        Field::new("osu_meh_hit_window", DataType::Float64, true),
-        Field::new("osu_n_large_ticks", DataType::UInt32, true),
-        
-        // taiko specific
-        Field::new("taiko_stamina", DataType::Float64, true),
-        Field::new("taiko_rhythm", DataType::Float64, true),
-        Field::new("taiko_color", DataType::Float64, true),
-        Field::new("taiko_reading", DataType::Float64, true),
-        Field::new("taiko_great_hit_window", DataType::Float64, true),
-        Field::new("taiko_ok_hit_window", DataType::Float64, true),
-        Field::new("taiko_mono_stamina_factor", DataType::Float64, true),
-        
-        // catch specific
-        Field::new("catch_ar", DataType::Float64, true),
-        Field::new("catch_n_fruits", DataType::UInt32, true),
-        Field::new("catch_n_droplets", DataType::UInt32, true),
-        Field::new("catch_n_tiny_droplets", DataType::UInt32, true),
-        
-        // mania specific
-        Field::new("mania_n_objects", DataType::UInt32, true),
-        Field::new("mania_n_hold_notes", DataType::UInt32, true),
-        
-        // Common
-        Field::new("is_convert", DataType::Boolean, true),
-    ]))
-}
-
-/// Write enriched data to parquet, merging with existing file if present
-fn write_enriched_parquet(path: &Path, rows: &[BeatmapRow]) -> Result<usize> {
-    let schema = enriched_schema();
-    
-    // Build new batch from rows
-    let new_batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            // Identifiers
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.beatmap_id))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.beatmapset_id))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.folder_id.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.osu_file.as_str()))),
-            
-            // API Metadata
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.mode.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.version.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.url.as_str()))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.status.as_str()))),
-            Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.is_scoreable)))),
-            Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.convert)))),
-            
-            // Difficulty settings
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.ar))),
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.cs))),
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.od))),
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.hp))),
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.bpm))),
-            
-            // Counts
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.count_circles))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.count_sliders))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.count_spinners))),
-            
-            // Length
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.seconds_drain))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.seconds_total))),
-            
-            // Stats
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.playcount))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.passcount))),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.max_combo_api).collect::<Vec<_>>())),
-            Arc::new(Float32Array::from_iter_values(rows.iter().map(|r| r.stars_api))),
-            
-            // Other
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.checksum.as_str()))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.creator_id))),
-            Arc::new(Int64Array::from(rows.iter().map(|r| r.last_updated).collect::<Vec<_>>())),
-            
-            // PP Calculation
-            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.stars_calc))),
-            Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.max_pp))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.max_combo_calc))),
-            
-            // osu! specific
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_aim).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_speed).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_flashlight).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_slider_factor).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_speed_note_count).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_aim_difficult_slider_count).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_aim_difficult_strain_count).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_speed_difficult_strain_count).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_great_hit_window).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_ok_hit_window).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.osu_meh_hit_window).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.osu_n_large_ticks).collect::<Vec<_>>())),
-            
-            // taiko specific
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_stamina).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_rhythm).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_color).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_reading).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_great_hit_window).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_ok_hit_window).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.taiko_mono_stamina_factor).collect::<Vec<_>>())),
-            
-            // catch specific
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.catch_ar).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.catch_n_fruits).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.catch_n_droplets).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.catch_n_tiny_droplets).collect::<Vec<_>>())),
-            
-            // mania specific
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_objects).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.mania_n_hold_notes).collect::<Vec<_>>())),
-            
-            // is_convert
-            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_convert).collect::<Vec<_>>())),
-        ],
-    )?;
-    
-    // Merge with existing file
-    merge_and_write_parquet(path, &new_batch, schema)
-}
-
-/// Merge new batch with existing parquet file and write result, returns total rows
-fn merge_and_write_parquet(path: &Path, new_batch: &RecordBatch, schema: Arc<Schema>) -> Result<usize> {
-    let mut all_batches: Vec<RecordBatch> = Vec::new();
-    
-    // Read existing file if it exists
-    if path.exists() {
-        let file = File::open(path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-        for batch in reader {
-            all_batches.push(batch?);
-        }
-    }
-    
-    // Add new batch
-    all_batches.push(new_batch.clone());
-    
-    // Write merged result
-    let file = File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    
-    for batch in &all_batches {
-        writer.write(batch)?;
-    }
-    writer.close()?;
-    
-    let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
-    Ok(total_rows)
-}
-
-fn comments_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("beatmapset_id", DataType::UInt32, false),
-        Field::new("comment_id", DataType::UInt32, false),
-        Field::new("parent_id", DataType::UInt32, true),
-        Field::new("user_id", DataType::UInt32, true),
-        Field::new("legacy_name", DataType::Utf8, true),
-        Field::new("message", DataType::Utf8, true),
-        Field::new("message_html", DataType::Utf8, true),
-        Field::new("votes_count", DataType::UInt32, false),
-        Field::new("replies_count", DataType::UInt32, false),
-        Field::new("pinned", DataType::Boolean, false),
-        Field::new("commentable_type", DataType::Utf8, false),
-        Field::new("created_at", DataType::Int64, false),
-        Field::new("updated_at", DataType::Int64, false),
-        Field::new("edited_at", DataType::Int64, true),
-        Field::new("edited_by_id", DataType::UInt32, true),
-        Field::new("deleted_at", DataType::Int64, true),
-    ]))
-}
-
-/// Write comments to parquet, merging with existing file if present
-fn write_comments_parquet(path: &Path, rows: &[CommentRow]) -> Result<usize> {
-    let schema = comments_schema();
-
-    let new_batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.beatmapset_id))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.comment_id))),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.parent_id).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.user_id).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.legacy_name.as_deref()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.message.as_deref()).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.message_html.as_deref()).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.votes_count))),
-            Arc::new(UInt32Array::from_iter_values(rows.iter().map(|r| r.replies_count))),
-            Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.pinned)))),
-            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.commentable_type.as_str()))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.created_at))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.updated_at))),
-            Arc::new(Int64Array::from(rows.iter().map(|r| r.edited_at).collect::<Vec<_>>())),
-            Arc::new(UInt32Array::from(rows.iter().map(|r| r.edited_by_id).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(rows.iter().map(|r| r.deleted_at).collect::<Vec<_>>())),
-        ],
-    )?;
-
-    merge_and_write_parquet(path, &new_batch, schema)
 }
