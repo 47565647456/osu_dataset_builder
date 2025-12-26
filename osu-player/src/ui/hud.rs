@@ -127,6 +127,7 @@ fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>) {
                 right: Val::Px(10.0),
                 padding: UiRect::all(Val::Px(6.0)),
                 flex_direction: FlexDirection::Column,
+                width: Val::Px(120.0),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),

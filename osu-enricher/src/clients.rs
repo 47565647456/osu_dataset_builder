@@ -22,7 +22,7 @@ impl OsuClientPool {
         let mut clients = Vec::new();
         for (client_id, client_secret) in credentials {
             let client = Osu::new(client_id, client_secret).await?;
-            let rate_limiter = RateLimiter::direct(governor::Quota::per_minute(std::num::NonZeroU32::new(120).unwrap()));
+            let rate_limiter = RateLimiter::direct(governor::Quota::per_minute(std::num::NonZeroU32::new(600).unwrap()));
             clients.push(OsuClient {
                 client,
                 rate_limiter,
@@ -38,5 +38,9 @@ impl OsuClientPool {
     pub fn get_next(&self) -> &OsuClient {
         let idx = self.current.fetch_add(1, Ordering::SeqCst) % self.clients.len();
         &self.clients[idx]
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
     }
 }

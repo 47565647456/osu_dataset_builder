@@ -17,7 +17,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use futures::stream::{self, StreamExt};
 
 /// Enrich beatmap data with osu! API metadata and PP calculations
 #[derive(Parser, Debug)]
@@ -44,27 +45,27 @@ fn read_credentials(path: &Path) -> Result<Vec<(u64, String)>> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open credentials file: {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut lines = reader.lines();
     
     let mut credentials = Vec::new();
+    let lines: Vec<String> = reader.lines()
+        .filter_map(|l| l.ok())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
     
-    while let Some(line1) = lines.next() {
-        let client_id_str = line1.context("Failed to read client_id line")?;
-        let client_id = client_id_str.trim().parse::<u64>()
-            .context("client_id must be a number")?;
+    let mut iter = lines.into_iter();
+    while let Some(client_id_str) = iter.next() {
+        let client_id = client_id_str.parse::<u64>()
+            .with_context(|| format!("client_id '{}' must be a number", client_id_str))?;
             
-        let client_secret = lines
-            .next()
-            .context("Credentials file missing client_secret for a client_id")?
-            .context("Failed to read client_secret line")?
-            .trim()
-            .to_string();
+        let client_secret = iter.next()
+            .context("Credentials file missing client_secret for a client_id")?;
             
         credentials.push((client_id, client_secret));
     }
     
     if credentials.is_empty() {
-        anyhow::bail!("Credentials file is empty");
+        anyhow::bail!("Credentials file is empty or contains no valid pairs");
     }
     
     Ok(credentials)
@@ -74,7 +75,7 @@ fn read_credentials(path: &Path) -> Result<Vec<(u64, String)>> {
 
 /// Comprehensive beatmap row combining API metadata and PP calculations
 #[derive(Default)]
-struct BeatmapRow {
+pub(crate) struct BeatmapRow {
     // Identifiers
     beatmap_id: u32,
     beatmapset_id: u32,
@@ -161,7 +162,7 @@ struct BeatmapRow {
     pp_failed: Option<String>,  // Reason if PP calculation failed (e.g., "Suspicious map: Density")
 }
 
-struct CommentRow {
+pub(crate) struct CommentRow {
     beatmapset_id: u32,
     comment_id: u32,
     parent_id: Option<u32>,
@@ -184,7 +185,7 @@ struct CommentRow {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Arc::new(Args::parse());
 
     // Load API credentials from file
     println!("Reading credentials from {}...", args.credentials.display());
@@ -221,7 +222,7 @@ async fn main() -> Result<()> {
         .iter()
         .filter_map(|line| line.split(':').next()?.trim().parse().ok())
         .collect();
-    let mut failed_ids: HashSet<String> = failed_lines.into_iter().collect();
+    let failed_ids: HashSet<String> = failed_lines.into_iter().collect();
     let initial_failed_count = failed_id_set.len();
 
     // Filter out already-enriched and failed beatmaps
@@ -244,16 +245,17 @@ async fn main() -> Result<()> {
 
     println!("Enriching {} new beatmaps", beatmap_ids.len());
 
-    // Collect unique beatmapset IDs for comments
-    let mut beatmapset_ids: HashSet<u32> = HashSet::new();
-
     // Prepare output paths
     let enriched_path = args.dataset_dir.join("beatmap_enriched.parquet");
     let comments_path = args.dataset_dir.join("beatmap_comments.parquet");
 
     // Initialize batch writers for streaming output
-    let mut enriched_writer = batch_writer::EnrichedBatchWriter::new(&enriched_path)?;
-    let mut comments_writer = batch_writer::CommentsBatchWriter::new(&comments_path)?;
+    let enriched_writer = Arc::new(Mutex::new(batch_writer::EnrichedBatchWriter::new(&enriched_path)?));
+    let comments_writer = Arc::new(Mutex::new(batch_writer::CommentsBatchWriter::new(&comments_path)?));
+
+    // Shared thread-safe collections
+    let beatmapset_ids = Arc::new(Mutex::new(HashSet::new()));
+    let failed_ids = Arc::new(Mutex::new(failed_ids));
 
     // Set up graceful shutdown
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -273,103 +275,114 @@ async fn main() -> Result<()> {
             .progress_chars("#>-"),
     );
 
-    // Fetch metadata for each beatmap
-    for (beatmap_id, folder_id, osu_file) in &beatmap_ids {
-        // Check if shutdown was requested
-        if shutdown_requested.load(Ordering::SeqCst) {
-            pb.println("🛑 Stopping gracefully...");
+    // Fetch metadata for each beatmap in parallel
+    let pool = Arc::new(pool);
+    let parallelism = pool.client_count() * 2;
+    
+    let mut stream = stream::iter(beatmap_ids.iter())
+        .map(|(beatmap_id, folder_id, osu_file)| {
+            let pool = Arc::clone(&pool);
+            let source_dir = args.source_dir.clone();
+            let beatmapset_ids = Arc::clone(&beatmapset_ids);
+            let failed_ids = Arc::clone(&failed_ids);
+            let enriched_writer = Arc::clone(&enriched_writer);
+            let shutdown_requested = Arc::clone(&shutdown_requested);
+            let pb = pb.clone();
+            
+            async move {
+                if shutdown_requested.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+
+                pb.set_message(format!("Fetching {}", beatmap_id));
+                
+                let osu_client = pool.get_next();
+                osu_client.rate_limiter.until_ready().await;
+
+                let mut row = BeatmapRow {
+                    beatmap_id: *beatmap_id,
+                    folder_id: folder_id.clone(),
+                    osu_file: osu_file.clone(),
+                    ..Default::default()
+                };
+
+                match osu_client.client.beatmap().map_id(*beatmap_id).await {
+                    Ok(beatmap) => {
+                        beatmapset_ids.lock().unwrap().insert(beatmap.mapset_id);
+                        
+                        row.beatmapset_id = beatmap.mapset_id;
+                        row.mode = format!("{:?}", beatmap.mode).to_lowercase();
+                        row.version = beatmap.version.clone();
+                        row.url = beatmap.url.clone();
+                        row.status = format!("{:?}", beatmap.status);
+                        row.is_scoreable = beatmap.is_scoreable;
+                        row.convert = beatmap.convert;
+                        row.ar = beatmap.ar;
+                        row.cs = beatmap.cs;
+                        row.od = beatmap.od;
+                        row.hp = beatmap.hp;
+                        row.bpm = beatmap.bpm;
+                        row.count_circles = beatmap.count_circles;
+                        row.count_sliders = beatmap.count_sliders;
+                        row.count_spinners = beatmap.count_spinners;
+                        row.seconds_drain = beatmap.seconds_drain;
+                        row.seconds_total = beatmap.seconds_total;
+                        row.playcount = beatmap.playcount;
+                        row.passcount = beatmap.passcount;
+                        row.max_combo_api = beatmap.max_combo;
+                        row.stars_api = beatmap.stars;
+                        row.checksum = beatmap.checksum.unwrap_or_default();
+                        row.creator_id = beatmap.creator_id;
+                        row.last_updated = Some(beatmap.last_updated.unix_timestamp());
+                    }
+                    Err(e) => {
+                        let error_str = format!("{}", e);
+                        if error_str.contains("404") || error_str.contains("missing") {
+                            failed_ids.lock().unwrap().insert(format!("{}: {}", beatmap_id, e));
+                        }
+                        pb.println(format!("⚠ Failed to fetch API data for {}: {}", beatmap_id, e));
+                    }
+                }
+
+                let osu_path = source_dir.join(&folder_id).join(&osu_file);
+                if osu_path.exists() {
+                    match calculate_difficulty(&osu_path, &mut row) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            row.pp_failed = Some(format!("{}", e));
+                            pb.println(format!("⚠ Failed to calculate PP for {}: {}", osu_file, e));
+                        }
+                    }
+                }
+
+                enriched_writer.lock().unwrap_or_else(|e| e.into_inner()).write(row)?;
+                pb.inc(1);
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(parallelism);
+
+    while let Some(res) = stream.next().await {
+        if let Err(e) = res {
+            pb.println(format!("🛑 Critical error in fetch stream: {}", e));
             interrupted = true;
             break;
         }
-
-        pb.set_message(format!("Fetching {}", beatmap_id));
-        
-        // Get next client from pool
-        let osu_client = pool.get_next();
-        
-        // Rate limit
-        osu_client.rate_limiter.until_ready().await;
-
-        let mut row = BeatmapRow {
-            beatmap_id: *beatmap_id,
-            folder_id: folder_id.clone(),
-            osu_file: osu_file.clone(),
-            ..Default::default()
-        };
-
-        // Fetch from API
-        match osu_client.client.beatmap().map_id(*beatmap_id).await {
-            Ok(beatmap) => {
-                beatmapset_ids.insert(beatmap.mapset_id);
-                
-                // API Metadata
-                row.beatmapset_id = beatmap.mapset_id;
-                row.mode = format!("{:?}", beatmap.mode).to_lowercase();
-                row.version = beatmap.version.clone();
-                row.url = beatmap.url.clone();
-                row.status = format!("{:?}", beatmap.status);
-                row.is_scoreable = beatmap.is_scoreable;
-                row.convert = beatmap.convert;
-                
-                // Difficulty settings
-                row.ar = beatmap.ar;
-                row.cs = beatmap.cs;
-                row.od = beatmap.od;
-                row.hp = beatmap.hp;
-                row.bpm = beatmap.bpm;
-                
-                // Counts
-                row.count_circles = beatmap.count_circles;
-                row.count_sliders = beatmap.count_sliders;
-                row.count_spinners = beatmap.count_spinners;
-                
-                // Length
-                row.seconds_drain = beatmap.seconds_drain;
-                row.seconds_total = beatmap.seconds_total;
-                
-                // Stats
-                row.playcount = beatmap.playcount;
-                row.passcount = beatmap.passcount;
-                row.max_combo_api = beatmap.max_combo;
-                row.stars_api = beatmap.stars;
-                
-                // Other
-                row.checksum = beatmap.checksum.unwrap_or_default();
-                row.creator_id = beatmap.creator_id;
-                row.last_updated = Some(beatmap.last_updated.unix_timestamp());
-            }
-            Err(e) => {
-                let error_str = format!("{}", e);
-                // Track 404s and other permanent errors
-                if error_str.contains("404") || error_str.contains("missing") {
-                    failed_ids.insert(format!("{}: {}", beatmap_id, e));
-                }
-                pb.println(format!("⚠ Failed to fetch API data for {}: {}", beatmap_id, e));
-            }
+        if shutdown_requested.load(Ordering::SeqCst) {
+            interrupted = true;
+            break;
         }
-
-        // Calculate PP from local file
-        let osu_path = args.source_dir.join(&folder_id).join(&osu_file);
-        if osu_path.exists() {
-            match calculate_difficulty(&osu_path, &mut row) {
-                Ok(_) => {}
-                Err(e) => {
-                    row.pp_failed = Some(format!("{}", e));
-                    pb.println(format!("⚠ Failed to calculate PP for {}: {}", osu_file, e));
-                }
-            }
-        }
-
-        enriched_writer.write(row)?;
-        pb.inc(1);
     }
+    drop(stream); // Release Arc references
 
     pb.finish_with_message("Beatmap fetching complete");
 
     // Get ALL beatmapset_ids from enriched data (including previous runs)
     // Combined with beatmapset_ids from this run
     let all_enriched_beatmapset_ids = read_all_enriched_beatmapset_ids(&args.dataset_dir);
-    let all_beatmapset_ids: HashSet<u32> = all_enriched_beatmapset_ids.union(&beatmapset_ids).copied().collect();
+    let current_beatmapset_ids = beatmapset_ids.lock().unwrap_or_else(|e| e.into_inner());
+    let all_beatmapset_ids: HashSet<u32> = all_enriched_beatmapset_ids.union(&current_beatmapset_ids).copied().collect();
+    drop(current_beatmapset_ids);
     
     // Read already-commented beatmapset_ids (unless --force)
     let existing_commented: HashSet<u32> = if !args.force {
@@ -398,88 +411,109 @@ async fn main() -> Result<()> {
             .progress_chars("#>-"),
     );
 
-    for beatmapset_id in &new_beatmapset_ids {
-        // Check if shutdown was requested
-        if shutdown_requested.load(Ordering::SeqCst) {
-            pb2.println("🛑 Stopping gracefully...");
-            break;
-        }
-
-        // Get next client from pool
-        let osu_client = pool.get_next();
-
-        osu_client.rate_limiter.until_ready().await;
-
-        match osu_client.client
-            .comments()
-            .commentable_type("beatmapset")
-            .commentable_id(*beatmapset_id)
-            .await
-        {
-            Ok(bundle) => {
-                // Helper to convert Comment to CommentRow
-                let to_row = |comment: &rosu_v2::model::comments::Comment, mapset_id: u32| CommentRow {
-                    beatmapset_id: mapset_id,
-                    comment_id: comment.comment_id,
-                    parent_id: comment.parent_id,
-                    user_id: comment.user_id,
-                    legacy_name: comment.legacy_name.as_ref().map(|s| s.to_string()),
-                    message: comment.message.clone(),
-                    message_html: comment.message_html.clone(),
-                    votes_count: comment.votes_count,
-                    replies_count: comment.replies_count,
-                    pinned: comment.pinned,
-                    commentable_type: comment.commentable_type.clone(),
-                    created_at: comment.created_at.unix_timestamp(),
-                    updated_at: comment.updated_at.unix_timestamp(),
-                    edited_at: comment.edited_at.map(|t| t.unix_timestamp()),
-                    edited_by_id: comment.edited_by_id,
-                    deleted_at: comment.deleted_at.map(|t| t.unix_timestamp()),
-                };
-
-                // Add main comments
-                for comment in &bundle.comments {
-                    comments_writer.write(to_row(comment, *beatmapset_id))?;
+    // Fetch comments for each beatmapset in parallel
+    let mut comment_stream = stream::iter(new_beatmapset_ids.iter())
+        .map(|beatmapset_id| {
+            let pool = Arc::clone(&pool);
+            let comments_writer = Arc::clone(&comments_writer);
+            let shutdown_requested = Arc::clone(&shutdown_requested);
+            let pb2 = pb2.clone();
+            let beatmapset_id = *beatmapset_id;
+            
+            async move {
+                if shutdown_requested.load(Ordering::SeqCst) {
+                    return Ok(());
                 }
 
-                // Add included comments (replies, parents)
-                for comment in &bundle.included_comments {
-                    comments_writer.write(to_row(comment, *beatmapset_id))?;
-                }
+                let osu_client = pool.get_next();
+                osu_client.rate_limiter.until_ready().await;
 
-                // Add pinned comments if present
-                if let Some(pinned) = &bundle.pinned_comments {
-                    for comment in pinned {
-                        // Only add if not already in comments
-                        if !bundle.comments.iter().any(|c| c.comment_id == comment.comment_id) {
-                            comments_writer.write(to_row(comment, *beatmapset_id))?;
+                match osu_client.client
+                    .comments()
+                    .commentable_type("beatmapset")
+                    .commentable_id(beatmapset_id)
+                    .await
+                {
+                    Ok(bundle) => {
+                        let to_row = |comment: &rosu_v2::model::comments::Comment, mapset_id: u32| CommentRow {
+                            beatmapset_id: mapset_id,
+                            comment_id: comment.comment_id,
+                            parent_id: comment.parent_id,
+                            user_id: comment.user_id,
+                            legacy_name: comment.legacy_name.as_ref().map(|s| s.to_string()),
+                            message: comment.message.clone(),
+                            message_html: comment.message_html.clone(),
+                            votes_count: comment.votes_count,
+                            replies_count: comment.replies_count,
+                            pinned: comment.pinned,
+                            commentable_type: comment.commentable_type.clone(),
+                            created_at: comment.created_at.unix_timestamp(),
+                            updated_at: comment.updated_at.unix_timestamp(),
+                            edited_at: comment.edited_at.map(|t| t.unix_timestamp()),
+                            edited_by_id: comment.edited_by_id,
+                            deleted_at: comment.deleted_at.map(|t| t.unix_timestamp()),
+                        };
+
+                        let mut writer = comments_writer.lock().unwrap_or_else(|e| e.into_inner());
+                        for comment in &bundle.comments {
+                            writer.write(to_row(comment, beatmapset_id))?;
+                        }
+                        for comment in &bundle.included_comments {
+                            writer.write(to_row(comment, beatmapset_id))?;
+                        }
+                        if let Some(pinned) = &bundle.pinned_comments {
+                            for comment in pinned {
+                                if !bundle.comments.iter().any(|c| c.comment_id == comment.comment_id) {
+                                    writer.write(to_row(comment, beatmapset_id))?;
+                                }
+                            }
                         }
                     }
+                    Err(e) => {
+                        pb2.println(format!("⚠ Failed to fetch comments for mapset {}: {}", beatmapset_id, e));
+                    }
                 }
-            }
-            Err(e) => {
-                pb2.println(format!("⚠ Failed to fetch comments for mapset {}: {}", beatmapset_id, e));
-            }
-        }
 
-        pb2.inc(1);
+                pb2.inc(1);
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(parallelism);
+
+    while let Some(res) = comment_stream.next().await {
+        if let Err(e) = res {
+            pb2.println(format!("🛑 Critical error in comment stream: {}", e));
+            break;
+        }
+        if shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
     }
+    drop(comment_stream); // Release Arc references
 
     pb2.finish_with_message("Comment fetching complete");
 
     // Close batch writers and get totals (handles merge automatically)
     println!("\n=== Writing Parquet Files ===");
-    let enriched_total = enriched_writer.close()?;
+    
+    let enriched_total = match Arc::try_unwrap(enriched_writer) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()).close()?,
+        Err(_) => anyhow::bail!("Failed to unwrap enriched_writer: active references remain"),
+    };
     println!("  beatmap_enriched.parquet: {} rows", enriched_total);
     
-    let comments_total = comments_writer.close()?;
+    let comments_total = match Arc::try_unwrap(comments_writer) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()).close()?,
+        Err(_) => anyhow::bail!("Failed to unwrap comments_writer: active references remain"),
+    };
     println!("  beatmap_comments.parquet: {} rows", comments_total);
 
     // Save failed list if there are new failures
-    let new_failures = failed_ids.len() - initial_failed_count;
+    let final_failed_ids = failed_ids.lock().unwrap_or_else(|e| e.into_inner());
+    let new_failures = final_failed_ids.len() - initial_failed_count;
     if new_failures > 0 {
-        let content: String = failed_ids.iter().map(|s| format!("{}\n", s)).collect();
-        let _ = std::fs::write(&failed_path, content);
+        let content: String = final_failed_ids.iter().map(|s| format!("{}\n", s)).collect();
+        let _ = std::fs::write(&args.dataset_dir.join("failed_beatmaps.txt"), content);
         println!("Added {} beatmaps to failed_beatmaps.txt", new_failures);
     }
 
