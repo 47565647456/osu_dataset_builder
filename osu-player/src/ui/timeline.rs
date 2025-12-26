@@ -5,6 +5,7 @@ use bevy::ui::RelativeCursorPosition;
 
 use crate::beatmap::BeatmapView;
 use crate::playback::PlaybackStateRes;
+use crate::ui::UiFont;
 
 pub struct TimelinePlugin;
 
@@ -54,7 +55,9 @@ pub struct TotalTimeText;
 #[derive(Component)]
 pub struct DensityBar(pub usize);
 
-fn setup_timeline(mut commands: Commands) {
+fn setup_timeline(mut commands: Commands, ui_font: Res<UiFont>) {
+    let font = ui_font.0.clone();
+
     // Timeline container at bottom
     commands
         .spawn((
@@ -110,6 +113,7 @@ fn setup_timeline(mut commands: Commands) {
                     scrubber.spawn((
                         Text::new("00:00.00"),
                         TextFont {
+                            font: font.clone(),
                             font_size: 14.0,
                             ..default()
                         },
@@ -164,6 +168,7 @@ fn setup_timeline(mut commands: Commands) {
                     scrubber.spawn((
                         Text::new("00:00.00"),
                         TextFont {
+                            font: font.clone(),
                             font_size: 14.0,
                             ..default()
                         },

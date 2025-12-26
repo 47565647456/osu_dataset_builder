@@ -4,6 +4,7 @@ use bevy::prelude::*;
 
 use crate::beatmap::BeatmapView;
 use crate::playback::{PlaybackState, PlaybackStateRes};
+use crate::ui::UiFont;
 
 pub struct ControlsPlugin;
 
@@ -34,7 +35,9 @@ pub struct ObjectCountText;
 #[allow(dead_code)]
 pub struct AudioStatusText;
 
-fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
+fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Res<UiFont>) {
+    let font = ui_font.0.clone();
+
     // Control bar above timeline
     commands
         .spawn((
@@ -67,6 +70,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
                     btn.spawn((
                         Text::new("▶ Play"),
                         TextFont {
+                            font: font.clone(),
                             font_size: 14.0,
                             ..default()
                         },
@@ -88,6 +92,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
             parent.spawn((
                 Text::new("Speed:"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 14.0,
                     ..default()
                 },
@@ -109,6 +114,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
                     btn.spawn((
                         Text::new("1.00x"),
                         TextFont {
+                            font: font.clone(),
                             font_size: 14.0,
                             ..default()
                         },
@@ -130,6 +136,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
             parent.spawn((
                 Text::new(format!("Objects: {}", beatmap.objects.len())),
                 TextFont {
+                    font: font.clone(),
                     font_size: 14.0,
                     ..default()
                 },
@@ -147,6 +154,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>) {
             parent.spawn((
                 Text::new("Space: Play/Pause | ←/→: Seek | ↑/↓: Speed"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 12.0,
                     ..default()
                 },

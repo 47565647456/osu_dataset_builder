@@ -4,6 +4,7 @@ use bevy::prelude::*;
 
 use crate::beatmap::{BeatmapView, CountdownState};
 use crate::playback::PlaybackStateRes;
+use crate::ui::UiFont;
 
 pub struct OverlaysPlugin;
 
@@ -39,7 +40,9 @@ pub struct BreakProgressFill;
 #[derive(Component)]
 pub struct BreakTimeText;
 
-fn setup_overlays(mut commands: Commands) {
+fn setup_overlays(mut commands: Commands, ui_font: Res<UiFont>) {
+    let font = ui_font.0.clone();
+
     // Countdown container (centered)
     commands.spawn((
         Node {
@@ -55,11 +58,11 @@ fn setup_overlays(mut commands: Commands) {
         parent.spawn((
             Text::new(""),
             TextFont {
+                font: font.clone(),
                 font_size: 120.0,
                 ..default()
             },
             TextColor(Color::WHITE),
-            TextLayout::new_with_justify(Justify::Center),
             CountdownText,
         ));
     });
@@ -85,6 +88,7 @@ fn setup_overlays(mut commands: Commands) {
             parent.spawn((
                 Text::new("Break"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 36.0,
                     ..default()
                 },
@@ -120,6 +124,7 @@ fn setup_overlays(mut commands: Commands) {
             parent.spawn((
                 Text::new("0s"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 16.0,
                     ..default()
                 },

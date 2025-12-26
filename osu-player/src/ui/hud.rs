@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::beatmap::BeatmapView;
 use crate::playback::PlaybackStateRes;
+use crate::ui::UiFont;
 
 pub struct HudPlugin;
 
@@ -49,8 +50,9 @@ pub struct MapStatsContainer;
 #[derive(Component)]
 pub struct FpsText;
 
-fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>) {
+fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Res<UiFont>) {
     let bm = &beatmap.beatmap;
+    let font = ui_font.0.clone();
 
     // Combo counter (top-left)
     commands
@@ -68,6 +70,7 @@ fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>) {
             parent.spawn((
                 Text::new("0 / 0x"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 14.0,
                     ..default()
                 },
@@ -110,6 +113,7 @@ fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>) {
                 parent.spawn((
                     Text::new(stat),
                     TextFont {
+                        font: font.clone(),
                         font_size: 11.0,
                         ..default()
                     },
@@ -136,6 +140,7 @@ fn setup_hud(mut commands: Commands, beatmap: Res<BeatmapView>) {
             parent.spawn((
                 Text::new("FPS: 0"),
                 TextFont {
+                    font: font.clone(),
                     font_size: 12.0,
                     ..default()
                 },
