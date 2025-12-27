@@ -47,10 +47,7 @@ fn render_all_objects(
     let radius = transform.scale_radius(beatmap.circle_radius);
 
     // With SDF rendering, we only use gizmos for:
-    // - Combo numbers (drawn on top of SDF objects)
-    // - Slider ball
-    // - Reverse arrows
-    // - Spinners (not yet SDF)
+    // - (All now handled by SDF/Text2d - this loop kept for potential future overlays)
     for (_idx, obj, opacity) in visible.iter().rev() {
         match &obj.kind {
             RenderObjectKind::Circle => {
@@ -62,7 +59,7 @@ fn render_all_objects(
                 render_slider_overlay(&mut gizmos, obj, *opacity, radius, current_time, &transform, &beatmap);
             }
             RenderObjectKind::Spinner { .. } => {
-                render_spinner(&mut gizmos, obj, *opacity, current_time, &transform);
+                // Spinners are now SDF rendered in sdf_render.rs
             }
         }
     }

@@ -101,6 +101,31 @@ impl Material2d for ArrowMaterial {
     }
 }
 
+/// Material for rendering spinners with SDF
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct SpinnerMaterial {
+    #[uniform(0)]
+    pub uniforms: SpinnerUniforms,
+}
+
+/// Uniform data for spinner rendering
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct SpinnerUniforms {
+    pub color: LinearRgba,
+    pub center: Vec2,
+    pub max_radius: f32,
+    pub progress: f32,    // 0.0 to 1.0
+    pub rotation: f32,    // Rotation angle in radians
+    pub opacity: f32,
+    pub _padding: Vec2,   // For alignment
+}
+
+impl Material2d for SpinnerMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/spinner.wgsl".into()
+    }
+}
+
 /// Plugin to register SDF materials
 pub struct SdfMaterialsPlugin;
 
@@ -108,7 +133,7 @@ impl Plugin for SdfMaterialsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(Material2dPlugin::<SliderMaterial>::default())
             .add_plugins(Material2dPlugin::<CircleMaterial>::default())
-            .add_plugins(Material2dPlugin::<ArrowMaterial>::default());
+            .add_plugins(Material2dPlugin::<ArrowMaterial>::default())
+            .add_plugins(Material2dPlugin::<SpinnerMaterial>::default());
     }
 }
-

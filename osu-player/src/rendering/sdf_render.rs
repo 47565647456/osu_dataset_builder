@@ -4,9 +4,9 @@
 use bevy::prelude::*;
 use bevy::sprite_render::MeshMaterial2d;
 
-use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind};
+use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
 use crate::playback::PlaybackStateRes;
-use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms};
+use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
 use crate::rendering::PlayfieldTransform;
 use crate::ui::UiFont;
 
@@ -61,6 +61,10 @@ pub struct ArrowEntity {
     pub position: ArrowPosition,
 }
 
+/// Marker for spinner mesh entities
+#[derive(Component)]
+pub struct SpinnerMesh;
+
 /// Resource to track currently spawned SDF objects
 #[derive(Resource, Default)]
 pub struct SdfRenderState {
@@ -80,6 +84,8 @@ pub struct SdfRenderState {
     pub spawned_end_arrows: Vec<usize>,
     /// Indices of sliders with spawned start arrows
     pub spawned_start_arrows: Vec<usize>,
+    /// Indices of currently spawned spinners
+    pub spawned_spinners: Vec<usize>,
 }
 
 /// Plugin for SDF rendering system
@@ -103,6 +109,7 @@ fn spawn_sdf_objects(
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
+    mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
@@ -247,8 +254,21 @@ fn spawn_sdf_objects(
                     }
                 }
             }
-            RenderObjectKind::Spinner { .. } => {
-                // Spinners use gizmo rendering for now
+            RenderObjectKind::Spinner { duration } => {
+                if !state.spawned_spinners.contains(idx) {
+                    spawn_spinner(
+                        &mut commands,
+                        &mut meshes,
+                        &mut spinner_materials,
+                        *idx,
+                        obj,
+                        *duration,
+                        *opacity,
+                        current_time,
+                        &transform,
+                    );
+                    state.spawned_spinners.push(*idx);
+                }
             }
         }
     }
@@ -321,6 +341,57 @@ fn spawn_arrow(
         Transform::from_xyz(arrow_pos.x, arrow_pos.y, z),
         ArrowMesh,
         ArrowEntity { object_index: index, position },
+    ));
+}
+
+/// Spawn a spinner mesh entity
+fn spawn_spinner(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<SpinnerMaterial>>,
+    index: usize,
+    obj: &RenderObject,
+    duration: f64,
+    opacity: f32,
+    current_time: f64,
+    transform: &PlayfieldTransform,
+) {
+    // Spinner is centered on the playfield
+    let center = transform.osu_to_screen(PLAYFIELD_WIDTH / 2.0, PLAYFIELD_HEIGHT / 2.0);
+    let max_radius = transform.scale_radius(150.0);
+    
+    // Calculate initial progress and rotation
+    let elapsed = (current_time - obj.start_time).max(0.0);
+    let progress = (elapsed / duration).min(1.0) as f32;
+    let rotation = (current_time / 50.0).to_radians() as f32;
+    
+    // Create mesh large enough for spinner
+    let mesh_size = max_radius * 2.5;
+    let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
+    let mesh_handle = meshes.add(mesh);
+    
+    let material = SpinnerMaterial {
+        uniforms: SpinnerUniforms {
+            color: Color::WHITE.into(),
+            center,
+            max_radius,
+            progress,
+            rotation,
+            opacity,
+            _padding: Vec2::ZERO,
+        },
+    };
+    let material_handle = materials.add(material);
+    
+    // Z-ordering: spinner in front (user interacts with it)
+    let z = 0.5 - (index as f32 * 0.001);
+    
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
+        Transform::from_xyz(center.x, center.y, z),
+        SpinnerMesh,
+        SdfHitObject { object_index: index },
     ));
 }
 
@@ -675,11 +746,13 @@ fn update_sdf_materials(
     transform: Res<PlayfieldTransform>,
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
+    mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
     circle_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<CircleMesh>>,
     slider_head_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderHeadMesh>>,
     slider_tail_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderTailMesh>>,
     mut slider_ball_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>, &mut Transform), With<SliderBallMesh>>,
     slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
+    spinner_query: Query<(&SdfHitObject, &MeshMaterial2d<SpinnerMaterial>), With<SpinnerMesh>>,
 ) {
     let current_time = playback.current_time;
     let visible = beatmap.visible_objects(current_time);
@@ -757,6 +830,25 @@ fn update_sdf_materials(
             }
         }
     }
+
+    // Update spinner materials (rotation and progress are dynamic)
+    for (hit_obj, material_handle) in spinner_query.iter() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(material) = spinner_materials.get_mut(material_handle.id()) {
+                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
+                    if let RenderObjectKind::Spinner { duration } = &obj.kind {
+                        let elapsed = (current_time - obj.start_time).max(0.0);
+                        let progress = (elapsed / duration).min(1.0) as f32;
+                        let rotation = (current_time / 50.0).to_radians() as f32;
+                        
+                        material.uniforms.progress = progress;
+                        material.uniforms.rotation = rotation;
+                        material.uniforms.opacity = opacity;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Despawn objects that are no longer visible
@@ -786,6 +878,7 @@ fn despawn_invisible_objects(
             state.spawned_slider_tails.retain(|&i| i != hit_obj.object_index);
             state.spawned_slider_balls.retain(|&i| i != hit_obj.object_index);
             state.spawned_circles.retain(|&i| i != hit_obj.object_index);
+            state.spawned_spinners.retain(|&i| i != hit_obj.object_index);
         }
     }
 
