@@ -126,27 +126,31 @@ impl Material2d for SpinnerMaterial {
     }
 }
 
-/// Material for rendering SDF digits (0-9)
+/// Material for rendering MSDF text (digits)
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
-pub struct DigitMaterial {
+pub struct MsdfMaterial {
     #[uniform(0)]
-    pub uniforms: DigitUniforms,
+    pub uniforms: MsdfUniforms,
+    #[texture(1)]
+    #[sampler(2)]
+    pub texture: Handle<Image>,
 }
 
-/// Uniform data for digit rendering
+/// Uniform data for MSDF text rendering
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
-pub struct DigitUniforms {
+pub struct MsdfUniforms {
     pub color: LinearRgba,
-    pub center: Vec2,
-    pub size: f32,
-    pub digit: u32,       // 0-9
+    /// UV bounds in atlas: (left, bottom, right, top) normalized 0-1
+    pub uv_bounds: Vec4,
     pub opacity: f32,
-    pub _padding: Vec3,   // For alignment
+    /// Distance range (typically 2.0 from msdf-atlas-gen)
+    pub px_range: f32,
+    pub _padding: Vec2,
 }
 
-impl Material2d for DigitMaterial {
+impl Material2d for MsdfMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/digit_sdf.wgsl".into()
+        "shaders/msdf_text.wgsl".into()
     }
 }
 
@@ -182,7 +186,7 @@ impl Plugin for SdfMaterialsPlugin {
             .add_plugins(Material2dPlugin::<CircleMaterial>::default())
             .add_plugins(Material2dPlugin::<ArrowMaterial>::default())
             .add_plugins(Material2dPlugin::<SpinnerMaterial>::default())
-            .add_plugins(Material2dPlugin::<DigitMaterial>::default())
+            .add_plugins(Material2dPlugin::<MsdfMaterial>::default())
             .add_plugins(Material2dPlugin::<GridMaterial>::default());
     }
 }

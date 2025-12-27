@@ -6,7 +6,7 @@ use bevy::sprite_render::MeshMaterial2d;
 
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
 use crate::playback::PlaybackStateRes;
-use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, DigitMaterial, DigitUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
+use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, MsdfMaterial, MsdfUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
 use crate::rendering::PlayfieldTransform;
 
 /// Marker component for SDF-rendered hit objects
@@ -88,6 +88,44 @@ pub struct SdfRenderState {
     /// Last seen transform generation (for detecting resize/zoom changes)
     pub last_generation: u32,
 }
+use serde::Deserialize;
+
+/// MSDF font atlas resource with pre-computed glyph UVs
+#[derive(Resource)]
+pub struct MsdfAtlas {
+    pub texture: Handle<Image>,
+    /// UV bounds for digits 0-9 (left, bottom, right, top) normalized 0-1
+    pub digit_uvs: [Vec4; 10],
+    /// Distance range from atlas generation
+    pub px_range: f32,
+}
+
+impl Default for MsdfAtlas {
+    fn default() -> Self {
+        Self {
+            texture: Handle::default(),
+            digit_uvs: [Vec4::ZERO; 10],
+            px_range: 2.0, 
+        }
+    }
+}
+
+// JSON structures for parsing msdf-atlas-gen output
+#[derive(Deserialize)]
+struct AtlasBounds { left: f32, bottom: f32, right: f32, top: f32 }
+
+#[derive(Deserialize)]
+struct Glyph { unicode: u32, atlasBounds: Option<AtlasBounds> }
+
+#[derive(Deserialize)]
+struct AtlasInfo {
+     distanceRange: f32,
+     width: f32, 
+     height: f32 
+}
+
+#[derive(Deserialize)]
+struct MsdfJson { atlas: AtlasInfo, glyphs: Vec<Glyph> }
 
 /// Plugin for SDF rendering system
 pub struct SdfRenderPlugin;
@@ -95,12 +133,58 @@ pub struct SdfRenderPlugin;
 impl Plugin for SdfRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SdfRenderState>()
+            .init_resource::<MsdfAtlas>()
+            .add_systems(Startup, setup_msdf_atlas)
             .add_systems(Update, (
                 clear_on_transform_change,
                 spawn_sdf_objects,
                 update_sdf_materials,
                 despawn_invisible_objects,
             ).chain());
+    }
+}
+
+/// Load MSDF atlas texture and JSON metadata at startup
+fn setup_msdf_atlas(
+    asset_server: Res<AssetServer>,
+    mut atlas: ResMut<MsdfAtlas>,
+) {
+    atlas.texture = asset_server.load("fonts/digits_msdf.png");
+    
+    // Load and parse JSON metadata
+    // Using std::fs for simplicity since we don't need hot-reloading for metrics
+    if let Ok(json_str) = std::fs::read_to_string("assets/fonts/digits_msdf.json") {
+        if let Ok(data) = serde_json::from_str::<MsdfJson>(&json_str) {
+            let width = data.atlas.width;
+            let height = data.atlas.height;
+            
+            for glyph in data.glyphs {
+                // Check if it's a digit 0-9 (unicode 48-57)
+                if glyph.unicode >= 48 && glyph.unicode <= 57 {
+                    let index = (glyph.unicode - 48) as usize;
+                    if let Some(bounds) = glyph.atlasBounds {
+                        // Convert to normalized UV coordinates (0-1)
+                        // msdf-atlas-gen uses bottom-up Y origin, but GPU textures use top-down Y
+                        // So we need to flip the Y coordinates
+                        atlas.digit_uvs[index] = Vec4::new(
+                            bounds.left / width,
+                            1.0 - (bounds.top / height),      // Flip Y
+                            bounds.right / width,
+                            1.0 - (bounds.bottom / height)    // Flip Y
+                        );
+                    }
+                }
+            }
+            
+            // Use the distance range from the JSON (should be 2.0)
+            atlas.px_range = data.atlas.distanceRange;
+            
+            log::info!("Loaded MSDF atlas metadata for digits 0-9 (px_range: {})", atlas.px_range);
+        } else {
+            log::error!("Failed to parse digits_msdf.json");
+        }
+    } else {
+        log::error!("Failed to read digits_msdf.json");
     }
 }
 
@@ -146,7 +230,8 @@ fn spawn_sdf_objects(
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
     mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
-    mut digit_materials: ResMut<Assets<DigitMaterial>>,
+    mut msdf_materials: ResMut<Assets<MsdfMaterial>>,
+    atlas: Res<MsdfAtlas>,
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
@@ -229,7 +314,7 @@ fn spawn_sdf_objects(
                 }
                 // Spawn SDF digits for slider combo number
                 if !state.spawned_combo_texts.contains(idx) {
-                    spawn_combo_digits(&mut commands, &mut meshes, &mut digit_materials, *idx, obj, radius, *opacity, &transform);
+                    spawn_combo_digits(&mut commands, &mut meshes, &mut msdf_materials, &atlas, *idx, obj, radius, *opacity, &transform);
                     state.spawned_combo_texts.push(*idx);
                 }
                 // Spawn arrows for sliders with repeats
@@ -282,7 +367,7 @@ fn spawn_sdf_objects(
                 }
                 // Spawn SDF digits for circle combo number
                 if !state.spawned_combo_texts.contains(idx) {
-                    spawn_combo_digits(&mut commands, &mut meshes, &mut digit_materials, *idx, obj, radius, *opacity, &transform);
+                    spawn_combo_digits(&mut commands, &mut meshes, &mut msdf_materials, &atlas, *idx, obj, radius, *opacity, &transform);
                     state.spawned_combo_texts.push(*idx);
                 }
             }
@@ -306,11 +391,12 @@ fn spawn_sdf_objects(
     }
 }
 
-/// Spawn SDF digit mesh entities for combo number
+/// Spawn MSDF digit mesh entities for combo number  
 fn spawn_combo_digits(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<DigitMaterial>>,
+    materials: &mut ResMut<Assets<MsdfMaterial>>,
+    atlas: &MsdfAtlas,
     index: usize,
     obj: &RenderObject,
     radius: f32,
@@ -333,24 +419,27 @@ fn spawn_combo_digits(
     let z = 0.0 - (index as f32 * 0.0001);
     
     for (i, ch) in combo_str.chars().enumerate() {
-        let digit_value = ch.to_digit(10).unwrap_or(0);
+        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
         let digit_x = start_x + i as f32 * digit_width;
         let digit_center = Vec2::new(digit_x, pos.y);
         
-        // Create mesh for this digit
-        let mesh_size = digit_size * 2.0;
-        let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
+        // Create mesh for this digit - size matches digit dimensions
+        let mesh_size = digit_size;  // Single digit size, not doubled
+        let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size * 1.2));  // Slightly taller for proper aspect
         let mesh_handle = meshes.add(mesh);
         
-        let material = DigitMaterial {
-            uniforms: DigitUniforms {
+        // Get UV bounds for this digit from the atlas (use digit 0 as fallback)
+        let uv_bounds = atlas.digit_uvs.get(digit_value).copied().unwrap_or(atlas.digit_uvs[0]);
+        
+        let material = MsdfMaterial {
+            uniforms: MsdfUniforms {
                 color: Color::WHITE.into(),
-                center: digit_center,
-                size: digit_size,
-                digit: digit_value,
+                uv_bounds,
                 opacity,
-                _padding: Vec3::ZERO,
+                px_range: atlas.px_range,
+                _padding: Vec2::ZERO,
             },
+            texture: atlas.texture.clone(),
         };
         let material_handle = materials.add(material);
         
