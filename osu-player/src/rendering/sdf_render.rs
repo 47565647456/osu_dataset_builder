@@ -115,11 +115,16 @@ impl Default for MsdfAtlas {
 struct AtlasBounds { left: f32, bottom: f32, right: f32, top: f32 }
 
 #[derive(Deserialize)]
-struct Glyph { unicode: u32, atlasBounds: Option<AtlasBounds> }
+struct Glyph { 
+    unicode: u32, 
+    #[serde(rename = "atlasBounds")]
+    atlas_bounds: Option<AtlasBounds> 
+}
 
 #[derive(Deserialize)]
 struct AtlasInfo {
-     distanceRange: f32,
+    #[serde(rename = "distanceRange")]
+     distance_range: f32,
      width: f32, 
      height: f32 
 }
@@ -162,7 +167,7 @@ fn setup_msdf_atlas(
                 // Check if it's a digit 0-9 (unicode 48-57)
                 if glyph.unicode >= 48 && glyph.unicode <= 57 {
                     let index = (glyph.unicode - 48) as usize;
-                    if let Some(bounds) = glyph.atlasBounds {
+                    if let Some(bounds) = glyph.atlas_bounds {
                         // Convert to normalized UV coordinates (0-1)
                         // msdf-atlas-gen uses bottom-up Y origin, but GPU textures use top-down Y
                         // So we need to flip the Y coordinates
@@ -177,7 +182,7 @@ fn setup_msdf_atlas(
             }
             
             // Use the distance range from the JSON (should be 2.0)
-            atlas.px_range = data.atlas.distanceRange;
+            atlas.px_range = data.atlas.distance_range;
             
             log::info!("Loaded MSDF atlas metadata for digits 0-9 (px_range: {})", atlas.px_range);
         } else {
