@@ -3,15 +3,30 @@
 use bevy::prelude::*;
 
 use crate::beatmap::{PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
+use crate::rendering::sdf_materials::GridMaterial;
 
 pub struct PlayfieldPlugin;
 
 impl Plugin for PlayfieldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayfieldTransform>()
+            .init_resource::<ZoomLevel>()
             .add_systems(Startup, setup_camera)
             .add_systems(Startup, setup_playfield)
-            .add_systems(Update, update_playfield_transform);
+            .add_systems(Update, handle_zoom_input)
+            .add_systems(Update, update_playfield_transform.after(handle_zoom_input));
+    }
+}
+
+/// Resource for zoom level control
+#[derive(Resource)]
+pub struct ZoomLevel {
+    pub level: f32,  // 1.0 = normal, <1.0 = zoomed out, >1.0 = zoomed in
+}
+
+impl Default for ZoomLevel {
+    fn default() -> Self {
+        Self { level: 1.0 }
     }
 }
 
@@ -24,6 +39,8 @@ pub struct PlayfieldTransform {
     pub offset: Vec2,
     /// Playfield size in screen coordinates
     pub size: Vec2,
+    /// Generation counter - incremented when transform changes
+    pub generation: u32,
 }
 
 impl PlayfieldTransform {
@@ -51,14 +68,34 @@ fn setup_camera(mut commands: Commands) {
 }
 
 /// Setup the playfield background
-fn setup_playfield(mut commands: Commands) {
-    // Playfield background sprite
-    commands.spawn((
-        Sprite {
-            color: Color::srgb(0.08, 0.08, 0.12),
-            custom_size: Some(Vec2::new(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT)),
-            ..default()
+fn setup_playfield(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut grid_materials: ResMut<Assets<GridMaterial>>,
+) {
+    use crate::rendering::sdf_materials::{GridMaterial, GridUniforms};
+    use bevy::sprite_render::MeshMaterial2d;
+
+    // Create grid mesh covering playfield
+    let mesh = Mesh::from(Rectangle::new(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT));
+    let mesh_handle = meshes.add(mesh);
+
+    // Create grid material with thin grey lines
+    let material = GridMaterial {
+        uniforms: GridUniforms {
+            background_color: Color::srgb(0.06, 0.06, 0.09).into(),
+            line_color: Color::srgb(0.15, 0.15, 0.2).into(),
+            cell_size: 32.0,  // Grid cell size
+            line_thickness: 1.0,  // Thin lines
+            _padding: Vec2::ZERO,
         },
+    };
+    let material_handle = grid_materials.add(material);
+
+    // Playfield grid background
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
         Transform::from_xyz(0.0, 0.0, -10.0),
         PlayfieldBackground,
     ));
@@ -74,9 +111,40 @@ fn setup_playfield(mut commands: Commands) {
     ));
 }
 
-/// Update playfield transform based on window size
+/// Handle keyboard and mouse wheel input for zoom
+fn handle_zoom_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut scroll_events: EventReader<bevy::input::mouse::MouseWheel>,
+    mut zoom: ResMut<ZoomLevel>,
+) {
+    let zoom_speed = 0.05;
+    let scroll_zoom_speed = 0.1;
+    let min_zoom = 0.3;
+    let max_zoom = 2.0;
+
+    // Keyboard zoom
+    if keyboard.pressed(KeyCode::Equal) || keyboard.pressed(KeyCode::NumpadAdd) {
+        zoom.level = (zoom.level + zoom_speed).min(max_zoom);
+    }
+    if keyboard.pressed(KeyCode::Minus) || keyboard.pressed(KeyCode::NumpadSubtract) {
+        zoom.level = (zoom.level - zoom_speed).max(min_zoom);
+    }
+    // Reset zoom with 0 key
+    if keyboard.just_pressed(KeyCode::Digit0) || keyboard.just_pressed(KeyCode::Numpad0) {
+        zoom.level = 1.0;
+    }
+
+    // Mouse wheel zoom
+    for event in scroll_events.read() {
+        let delta = event.y * scroll_zoom_speed;
+        zoom.level = (zoom.level + delta).clamp(min_zoom, max_zoom);
+    }
+}
+
+/// Update playfield transform based on window size and zoom
 fn update_playfield_transform(
     windows: Query<&Window>,
+    zoom: Res<ZoomLevel>,
     mut transform: ResMut<PlayfieldTransform>,
     mut playfield_query: Query<&mut Transform, With<PlayfieldBackground>>,
     mut border_query: Query<&mut Transform, (Without<PlayfieldBackground>, Without<Camera2d>)>,
@@ -89,17 +157,24 @@ fn update_playfield_transform(
         let ui_height = 120.0;
         let available_height = window_height - ui_height;
 
-        // Calculate scale to fit playfield
+        // Calculate scale to fit playfield, then apply zoom
         let padding = 40.0;
         let scale_x = (window_width - padding * 2.0) / PLAYFIELD_WIDTH;
         let scale_y = (available_height - padding * 2.0) / PLAYFIELD_HEIGHT;
-        let scale = scale_x.min(scale_y);
+        let base_scale = scale_x.min(scale_y);
+        let scale = base_scale * zoom.level;
+
+        // Check if transform changed
+        let new_offset = Vec2::new(0.0, ui_height / 2.0);
+        if (transform.scale - scale).abs() > 0.001 || (transform.offset - new_offset).length() > 0.001 {
+            transform.generation = transform.generation.wrapping_add(1);
+        }
 
         transform.scale = scale;
         transform.size = Vec2::new(PLAYFIELD_WIDTH * scale, PLAYFIELD_HEIGHT * scale);
         
         // Center playfield, offset up to make room for UI
-        transform.offset = Vec2::new(0.0, ui_height / 2.0);
+        transform.offset = new_offset;
 
         // Update background sprite
         for mut tf in playfield_query.iter_mut() {
@@ -116,3 +191,4 @@ fn update_playfield_transform(
         }
     }
 }
+

@@ -4,6 +4,7 @@ use bevy::prelude::*;
 
 use crate::beatmap::BeatmapView;
 use crate::playback::{PlaybackState, PlaybackStateRes};
+use crate::rendering::ZoomLevel;
 use crate::ui::UiFont;
 
 pub struct ControlsPlugin;
@@ -14,7 +15,9 @@ impl Plugin for ControlsPlugin {
             .add_systems(Update, update_play_button)
             .add_systems(Update, update_speed_display)
             .add_systems(Update, update_object_count)
-            .add_systems(Update, handle_button_clicks);
+            .add_systems(Update, update_zoom_display)
+            .add_systems(Update, handle_button_clicks)
+            .add_systems(Update, handle_zoom_clicks);
     }
 }
 
@@ -34,6 +37,18 @@ pub struct ObjectCountText;
 #[derive(Component)]
 #[allow(dead_code)]
 pub struct AudioStatusText;
+
+/// Marker for zoom minus button
+#[derive(Component)]
+pub struct ZoomMinusButton;
+
+/// Marker for zoom plus button
+#[derive(Component)]
+pub struct ZoomPlusButton;
+
+/// Marker for zoom display text
+#[derive(Component)]
+pub struct ZoomDisplayText;
 
 fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Res<UiFont>) {
     let font = ui_font.0.clone();
@@ -144,6 +159,85 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
                 ObjectCountText,
             ));
 
+            // Separator
+            parent.spawn((
+                Node {
+                    width: Val::Px(1.0),
+                    height: Val::Px(20.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.3, 0.3, 0.35)),
+            ));
+
+            // Zoom label
+            parent.spawn((
+                Text::new("Zoom:"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.7, 0.7, 0.7)),
+            ));
+
+            // Zoom minus button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    ZoomMinusButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("-"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
+            // Zoom display
+            parent.spawn((
+                Text::new("100%"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                ZoomDisplayText,
+            ));
+
+            // Zoom plus button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    ZoomPlusButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("+"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
             // Spacer
             parent.spawn(Node {
                 flex_grow: 1.0,
@@ -209,8 +303,9 @@ fn update_object_count(
 
 fn handle_button_clicks(
     mut playback: ResMut<PlaybackStateRes>,
+    mouse: Res<ButtonInput<MouseButton>>,
     play_query: Query<&Interaction, (Changed<Interaction>, With<PlayPauseButton>)>,
-    speed_query: Query<&Interaction, (Changed<Interaction>, With<SpeedButton>)>,
+    speed_query: Query<&Interaction, With<SpeedButton>>,
 ) {
     for interaction in play_query.iter() {
         if *interaction == Interaction::Pressed {
@@ -218,9 +313,46 @@ fn handle_button_clicks(
         }
     }
 
+    // Speed button: left-click to speed up, right-click to slow down
     for interaction in speed_query.iter() {
+        if *interaction == Interaction::Hovered || *interaction == Interaction::Pressed {
+            if mouse.just_pressed(MouseButton::Left) {
+                playback.cycle_speed();
+            }
+            if mouse.just_pressed(MouseButton::Right) {
+                playback.cycle_speed_reverse();
+            }
+        }
+    }
+}
+
+fn update_zoom_display(
+    zoom: Res<ZoomLevel>,
+    mut query: Query<&mut Text, With<ZoomDisplayText>>,
+) {
+    for mut text in query.iter_mut() {
+        text.0 = format!("{:.0}%", zoom.level * 100.0);
+    }
+}
+
+fn handle_zoom_clicks(
+    mut zoom: ResMut<ZoomLevel>,
+    minus_query: Query<&Interaction, (Changed<Interaction>, With<ZoomMinusButton>)>,
+    plus_query: Query<&Interaction, (Changed<Interaction>, With<ZoomPlusButton>)>,
+) {
+    let step = 0.1;
+    let min_zoom = 0.3;
+    let max_zoom = 2.0;
+
+    for interaction in minus_query.iter() {
         if *interaction == Interaction::Pressed {
-            playback.cycle_speed();
+            zoom.level = (zoom.level - step).max(min_zoom);
+        }
+    }
+
+    for interaction in plus_query.iter() {
+        if *interaction == Interaction::Pressed {
+            zoom.level = (zoom.level + step).min(max_zoom);
         }
     }
 }

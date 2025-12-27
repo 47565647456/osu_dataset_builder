@@ -102,6 +102,18 @@ impl PlaybackStateRes {
         };
     }
 
+    /// Cycle through common speed values in reverse
+    pub fn cycle_speed_reverse(&mut self) {
+        self.speed = match self.speed {
+            s if s > 2.0 => 2.0,
+            s if s > 1.5 => 1.5,
+            s if s > 1.0 => 1.0,
+            s if s > 0.75 => 0.75,
+            s if s > 0.5 => 0.5,
+            _ => 2.0,
+        };
+    }
+
     /// Get formatted time string (MM:SS.ms)
     pub fn format_time(time_ms: f64) -> String {
         let total_secs = (time_ms / 1000.0).max(0.0);

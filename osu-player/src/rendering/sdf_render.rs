@@ -6,9 +6,8 @@ use bevy::sprite_render::MeshMaterial2d;
 
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
 use crate::playback::PlaybackStateRes;
-use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
+use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, DigitMaterial, DigitUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
 use crate::rendering::PlayfieldTransform;
-use crate::ui::UiFont;
 
 /// Marker component for SDF-rendered hit objects
 #[derive(Component)]
@@ -37,9 +36,9 @@ pub struct SliderBallMesh;
 #[derive(Component)]
 pub struct CircleMesh;
 
-/// Marker for combo number text entities
+/// Marker for SDF digit mesh entities (combo numbers)
 #[derive(Component)]
-pub struct ComboNumberText {
+pub struct SdfDigit {
     pub object_index: usize,
 }
 
@@ -86,6 +85,8 @@ pub struct SdfRenderState {
     pub spawned_start_arrows: Vec<usize>,
     /// Indices of currently spawned spinners
     pub spawned_spinners: Vec<usize>,
+    /// Last seen transform generation (for detecting resize/zoom changes)
+    pub last_generation: u32,
 }
 
 /// Plugin for SDF rendering system
@@ -95,10 +96,45 @@ impl Plugin for SdfRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SdfRenderState>()
             .add_systems(Update, (
+                clear_on_transform_change,
                 spawn_sdf_objects,
                 update_sdf_materials,
                 despawn_invisible_objects,
             ).chain());
+    }
+}
+
+/// Clear all spawned state when transform changes (resize/zoom)
+fn clear_on_transform_change(
+    mut commands: Commands,
+    transform: Res<PlayfieldTransform>,
+    mut state: ResMut<SdfRenderState>,
+    sdf_query: Query<Entity, With<SdfHitObject>>,
+    digit_query: Query<Entity, With<SdfDigit>>,
+    arrow_query: Query<Entity, With<ArrowEntity>>,
+) {
+    if state.last_generation != transform.generation {
+        // Transform changed - despawn all and clear state
+        for entity in sdf_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in digit_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        for entity in arrow_query.iter() {
+            commands.entity(entity).despawn();
+        }
+        
+        state.spawned_sliders.clear();
+        state.spawned_slider_heads.clear();
+        state.spawned_slider_tails.clear();
+        state.spawned_slider_balls.clear();
+        state.spawned_circles.clear();
+        state.spawned_combo_texts.clear();
+        state.spawned_end_arrows.clear();
+        state.spawned_start_arrows.clear();
+        state.spawned_spinners.clear();
+        state.last_generation = transform.generation;
     }
 }
 
@@ -110,11 +146,11 @@ fn spawn_sdf_objects(
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
     mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
+    mut digit_materials: ResMut<Assets<DigitMaterial>>,
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
     mut state: ResMut<SdfRenderState>,
-    ui_font: Option<Res<UiFont>>,
 ) {
     // Don't spawn until transform is initialized (first frame has scale = 0)
     if transform.scale <= 0.0 {
@@ -191,12 +227,10 @@ fn spawn_sdf_objects(
                     );
                     state.spawned_slider_balls.push(*idx);
                 }
-                // Spawn combo text for slider
+                // Spawn SDF digits for slider combo number
                 if !state.spawned_combo_texts.contains(idx) {
-                    if let Some(ref font) = ui_font {
-                        spawn_combo_text(&mut commands, *idx, obj, radius, &transform, font);
-                        state.spawned_combo_texts.push(*idx);
-                    }
+                    spawn_combo_digits(&mut commands, &mut meshes, &mut digit_materials, *idx, obj, radius, *opacity, &transform);
+                    state.spawned_combo_texts.push(*idx);
                 }
                 // Spawn arrows for sliders with repeats
                 if *repeats > 0 && path_points.len() >= 2 {
@@ -246,12 +280,10 @@ fn spawn_sdf_objects(
                     );
                     state.spawned_circles.push(*idx);
                 }
-                // Spawn combo text for circle
+                // Spawn SDF digits for circle combo number
                 if !state.spawned_combo_texts.contains(idx) {
-                    if let Some(ref font) = ui_font {
-                        spawn_combo_text(&mut commands, *idx, obj, radius, &transform, font);
-                        state.spawned_combo_texts.push(*idx);
-                    }
+                    spawn_combo_digits(&mut commands, &mut meshes, &mut digit_materials, *idx, obj, radius, *opacity, &transform);
+                    state.spawned_combo_texts.push(*idx);
                 }
             }
             RenderObjectKind::Spinner { duration } => {
@@ -274,32 +306,61 @@ fn spawn_sdf_objects(
     }
 }
 
-/// Spawn a combo number text entity
-fn spawn_combo_text(
+/// Spawn SDF digit mesh entities for combo number
+fn spawn_combo_digits(
     commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<DigitMaterial>>,
     index: usize,
     obj: &RenderObject,
     radius: f32,
+    opacity: f32,
     transform: &PlayfieldTransform,
-    font: &Res<UiFont>,
 ) {
     let pos = transform.osu_to_screen(obj.x, obj.y);
-    let text_size = radius * 0.8;  // Text size relative to circle
+    let digit_size = radius * 0.6;  // Size relative to circle
     
-    // Z-ordering: text on very top (above all SDF materials)
-    let z = 0.0 - (index as f32 * 0.0001);  // Slight z variation per object
+    // Convert combo number to string to get individual digits
+    let combo_str = obj.combo_number.to_string();
+    let num_digits = combo_str.len();
     
-    commands.spawn((
-        Text2d::new(obj.combo_number.to_string()),
-        TextFont {
-            font: font.0.clone(),
-            font_size: text_size,
-            ..default()
-        },
-        TextColor(Color::WHITE),
-        Transform::from_xyz(pos.x, pos.y, z),
-        ComboNumberText { object_index: index },
-    ));
+    // Calculate spacing and starting position for centered digits
+    let digit_width = digit_size * 0.7;  // Width of each digit including spacing
+    let total_width = digit_width * num_digits as f32;
+    let start_x = pos.x - total_width * 0.5 + digit_width * 0.5;
+    
+    // Z-ordering: digits on very top (above all SDF materials)
+    let z = 0.0 - (index as f32 * 0.0001);
+    
+    for (i, ch) in combo_str.chars().enumerate() {
+        let digit_value = ch.to_digit(10).unwrap_or(0);
+        let digit_x = start_x + i as f32 * digit_width;
+        let digit_center = Vec2::new(digit_x, pos.y);
+        
+        // Create mesh for this digit
+        let mesh_size = digit_size * 2.0;
+        let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
+        let mesh_handle = meshes.add(mesh);
+        
+        let material = DigitMaterial {
+            uniforms: DigitUniforms {
+                color: Color::WHITE.into(),
+                center: digit_center,
+                size: digit_size,
+                digit: digit_value,
+                opacity,
+                _padding: Vec3::ZERO,
+            },
+        };
+        let material_handle = materials.add(material);
+        
+        commands.spawn((
+            Mesh2d(mesh_handle),
+            MeshMaterial2d(material_handle),
+            Transform::from_xyz(digit_center.x, digit_center.y, z),
+            SdfDigit { object_index: index },
+        ));
+    }
 }
 
 /// Spawn a reverse arrow entity at a slider endpoint
@@ -858,7 +919,7 @@ fn despawn_invisible_objects(
     playback: Res<PlaybackStateRes>,
     mut state: ResMut<SdfRenderState>,
     query: Query<(Entity, &SdfHitObject)>,
-    combo_text_query: Query<(Entity, &ComboNumberText)>,
+    digit_query: Query<(Entity, &SdfDigit)>,
     arrow_query: Query<(Entity, &ArrowEntity)>,
 ) {
     let current_time = playback.current_time;
@@ -882,11 +943,11 @@ fn despawn_invisible_objects(
         }
     }
 
-    // Despawn combo texts separately
-    for (entity, combo_text) in combo_text_query.iter() {
-        if !visible_indices.contains(&combo_text.object_index) {
+    // Despawn SDF digits separately
+    for (entity, digit) in digit_query.iter() {
+        if !visible_indices.contains(&digit.object_index) {
             commands.entity(entity).despawn();
-            state.spawned_combo_texts.retain(|&i| i != combo_text.object_index);
+            state.spawned_combo_texts.retain(|&i| i != digit.object_index);
         }
     }
 

@@ -126,6 +126,53 @@ impl Material2d for SpinnerMaterial {
     }
 }
 
+/// Material for rendering SDF digits (0-9)
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct DigitMaterial {
+    #[uniform(0)]
+    pub uniforms: DigitUniforms,
+}
+
+/// Uniform data for digit rendering
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct DigitUniforms {
+    pub color: LinearRgba,
+    pub center: Vec2,
+    pub size: f32,
+    pub digit: u32,       // 0-9
+    pub opacity: f32,
+    pub _padding: Vec3,   // For alignment
+}
+
+impl Material2d for DigitMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/digit_sdf.wgsl".into()
+    }
+}
+
+/// Material for rendering grid background
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct GridMaterial {
+    #[uniform(0)]
+    pub uniforms: GridUniforms,
+}
+
+/// Uniform data for grid rendering
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct GridUniforms {
+    pub background_color: LinearRgba,
+    pub line_color: LinearRgba,
+    pub cell_size: f32,         // Size of each grid cell in pixels
+    pub line_thickness: f32,    // Thickness of grid lines
+    pub _padding: Vec2,
+}
+
+impl Material2d for GridMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/grid.wgsl".into()
+    }
+}
+
 /// Plugin to register SDF materials
 pub struct SdfMaterialsPlugin;
 
@@ -134,6 +181,8 @@ impl Plugin for SdfMaterialsPlugin {
         app.add_plugins(Material2dPlugin::<SliderMaterial>::default())
             .add_plugins(Material2dPlugin::<CircleMaterial>::default())
             .add_plugins(Material2dPlugin::<ArrowMaterial>::default())
-            .add_plugins(Material2dPlugin::<SpinnerMaterial>::default());
+            .add_plugins(Material2dPlugin::<SpinnerMaterial>::default())
+            .add_plugins(Material2dPlugin::<DigitMaterial>::default())
+            .add_plugins(Material2dPlugin::<GridMaterial>::default());
     }
 }
