@@ -76,12 +76,39 @@ impl Material2d for CircleMaterial {
     }
 }
 
+/// Material for rendering reverse arrows with SDF
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct ArrowMaterial {
+    #[uniform(0)]
+    pub uniforms: ArrowUniforms,
+}
+
+/// Uniform data for arrow rendering
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct ArrowUniforms {
+    pub color: LinearRgba,
+    pub center: Vec2,
+    pub size: f32,
+    pub direction: Vec2,  // Normalized direction vector
+    pub thickness: f32,
+    pub opacity: f32,
+    pub _padding: Vec2,  // For alignment
+}
+
+impl Material2d for ArrowMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/arrow.wgsl".into()
+    }
+}
+
 /// Plugin to register SDF materials
 pub struct SdfMaterialsPlugin;
 
 impl Plugin for SdfMaterialsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(Material2dPlugin::<SliderMaterial>::default())
-            .add_plugins(Material2dPlugin::<CircleMaterial>::default());
+            .add_plugins(Material2dPlugin::<CircleMaterial>::default())
+            .add_plugins(Material2dPlugin::<ArrowMaterial>::default());
     }
 }
+

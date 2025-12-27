@@ -6,7 +6,7 @@ use bevy::sprite_render::MeshMaterial2d;
 
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind};
 use crate::playback::PlaybackStateRes;
-use crate::rendering::sdf_materials::{CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms};
+use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms};
 use crate::rendering::PlayfieldTransform;
 use crate::ui::UiFont;
 
@@ -43,6 +43,24 @@ pub struct ComboNumberText {
     pub object_index: usize,
 }
 
+/// Marker for arrow mesh entities
+#[derive(Component)]
+pub struct ArrowMesh;
+
+/// Which position an arrow is placed at
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArrowPosition {
+    Start,
+    End,
+}
+
+/// Component tracking arrow entity data
+#[derive(Component)]
+pub struct ArrowEntity {
+    pub object_index: usize,
+    pub position: ArrowPosition,
+}
+
 /// Resource to track currently spawned SDF objects
 #[derive(Resource, Default)]
 pub struct SdfRenderState {
@@ -58,6 +76,10 @@ pub struct SdfRenderState {
     pub spawned_circles: Vec<usize>,
     /// Indices of currently spawned combo number texts
     pub spawned_combo_texts: Vec<usize>,
+    /// Indices of sliders with spawned end arrows
+    pub spawned_end_arrows: Vec<usize>,
+    /// Indices of sliders with spawned start arrows
+    pub spawned_start_arrows: Vec<usize>,
 }
 
 /// Plugin for SDF rendering system
@@ -80,6 +102,7 @@ fn spawn_sdf_objects(
     mut meshes: ResMut<Assets<Mesh>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
+    mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
@@ -97,7 +120,7 @@ fn spawn_sdf_objects(
 
     for (idx, obj, opacity) in visible.iter() {
         match &obj.kind {
-        RenderObjectKind::Slider { path_points, .. } => {
+        RenderObjectKind::Slider { path_points, repeats, .. } => {
                 if !state.spawned_sliders.contains(idx) {
                     spawn_slider(
                         &mut commands,
@@ -168,6 +191,37 @@ fn spawn_sdf_objects(
                         state.spawned_combo_texts.push(*idx);
                     }
                 }
+                // Spawn arrows for sliders with repeats
+                if *repeats > 0 && path_points.len() >= 2 {
+                    // End arrow (pointing toward start)
+                    if !state.spawned_end_arrows.contains(idx) {
+                        let end = path_points.last().unwrap();
+                        let prev = &path_points[path_points.len() - 2];
+                        let end_pos = transform.osu_to_screen(end.0, end.1);
+                        let prev_pos = transform.osu_to_screen(prev.0, prev.1);
+                        let direction = prev_pos - end_pos;  // Points toward start
+                        spawn_arrow(
+                            &mut commands, &mut meshes, &mut arrow_materials,
+                            *idx, ArrowPosition::End, end_pos, direction,
+                            radius * 0.6, *opacity,
+                        );
+                        state.spawned_end_arrows.push(*idx);
+                    }
+                    // Start arrow (pointing toward end) - only for 2+ repeats
+                    if *repeats >= 2 && !state.spawned_start_arrows.contains(idx) {
+                        let start = &path_points[0];
+                        let next = &path_points[1];
+                        let start_pos = transform.osu_to_screen(start.0, start.1);
+                        let next_pos = transform.osu_to_screen(next.0, next.1);
+                        let direction = next_pos - start_pos;  // Points toward end
+                        spawn_arrow(
+                            &mut commands, &mut meshes, &mut arrow_materials,
+                            *idx, ArrowPosition::Start, start_pos, direction,
+                            radius * 0.6, *opacity,
+                        );
+                        state.spawned_start_arrows.push(*idx);
+                    }
+                }
             }
             RenderObjectKind::Circle => {
                 if !state.spawned_circles.contains(idx) {
@@ -228,7 +282,48 @@ fn spawn_combo_text(
     ));
 }
 
-/// Spawn a slider mesh entity
+/// Spawn a reverse arrow entity at a slider endpoint
+fn spawn_arrow(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ArrowMaterial>>,
+    index: usize,
+    position: ArrowPosition,
+    arrow_pos: Vec2,
+    direction: Vec2,  // Direction arrow points toward
+    size: f32,
+    opacity: f32,
+) {
+    // Create square mesh for arrow
+    let mesh_size = size * 3.0;  // Mesh needs to be larger than arrow
+    let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
+    let mesh_handle = meshes.add(mesh);
+
+    let material = ArrowMaterial {
+        uniforms: ArrowUniforms {
+            color: Color::WHITE.into(),
+            center: arrow_pos,
+            size,
+            direction: direction.normalize_or_zero(),
+            thickness: size * 0.03,
+            opacity,
+            _padding: Vec2::ZERO,
+        },
+    };
+    let material_handle = materials.add(material);
+
+    // Z-ordering: arrows on top of circles but below combo text
+    let z = -0.4 - (index as f32 * 0.001);
+
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
+        Transform::from_xyz(arrow_pos.x, arrow_pos.y, z),
+        ArrowMesh,
+        ArrowEntity { object_index: index, position },
+    ));
+}
+
 fn spawn_slider(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
@@ -672,6 +767,7 @@ fn despawn_invisible_objects(
     mut state: ResMut<SdfRenderState>,
     query: Query<(Entity, &SdfHitObject)>,
     combo_text_query: Query<(Entity, &ComboNumberText)>,
+    arrow_query: Query<(Entity, &ArrowEntity)>,
 ) {
     let current_time = playback.current_time;
     let visible = beatmap.visible_objects(current_time);
@@ -698,6 +794,17 @@ fn despawn_invisible_objects(
         if !visible_indices.contains(&combo_text.object_index) {
             commands.entity(entity).despawn();
             state.spawned_combo_texts.retain(|&i| i != combo_text.object_index);
+        }
+    }
+
+    // Despawn arrows separately
+    for (entity, arrow) in arrow_query.iter() {
+        if !visible_indices.contains(&arrow.object_index) {
+            commands.entity(entity).despawn();
+            match arrow.position {
+                ArrowPosition::End => state.spawned_end_arrows.retain(|&i| i != arrow.object_index),
+                ArrowPosition::Start => state.spawned_start_arrows.retain(|&i| i != arrow.object_index),
+            }
         }
     }
 }
