@@ -48,10 +48,19 @@ fn start_audio_when_ready(
     audio: Res<Audio>,
     asset_server: Res<AssetServer>,
     mut audio_state: ResMut<AudioState>,
+    mut audio_instances: ResMut<Assets<AudioInstance>>,
     playback_state: Res<PlaybackStateRes>,
 ) {
     // Only start audio once when playing and not already started
     if playback_state.state == PlaybackState::Playing && !audio_state.started {
+        // Stop any existing audio instance first
+        if let Some(instance_handle) = &audio_state.instance {
+            if let Some(instance) = audio_instances.get_mut(instance_handle) {
+                instance.stop(AudioTween::default());
+            }
+        }
+        audio_state.instance = None;
+
         if let Some(path) = &audio_state.audio_path {
             log::info!("Starting audio from: {}", path.display());
             
@@ -130,7 +139,7 @@ fn handle_audio_seek(
 /// System to sync playback time from audio position (when playing)
 fn sync_time_from_audio(
     mut audio_state: ResMut<AudioState>,
-    audio_instances: Res<Assets<AudioInstance>>,
+    mut audio_instances: ResMut<Assets<AudioInstance>>,
     mut playback_state: ResMut<PlaybackStateRes>,
 ) {
     // Only sync when audio is playing and started
@@ -138,39 +147,49 @@ fn sync_time_from_audio(
         return;
     }
 
-    if let Some(instance_handle) = &audio_state.instance {
-        if let Some(instance) = audio_instances.get(instance_handle) {
-            // Check if audio has stopped/finished
-            let state = instance.state();
+    // Clone the handle to avoid borrow conflict
+    let instance_handle = match audio_state.instance.clone() {
+        Some(h) => h,
+        None => return,
+    };
+
+    if let Some(instance) = audio_instances.get(&instance_handle) {
+        // Check if audio has stopped/finished
+        let state = instance.state();
+        
+        // Get audio position and sync to playback if available
+        if let Some(position_secs) = state.position() {
+            let audio_time_ms = position_secs * 1000.0;
             
-            // Get audio position and sync to playback if available
-            if let Some(position_secs) = state.position() {
-                let audio_time_ms = position_secs * 1000.0;
-                
-                // Update last seek time to stay in sync
-                audio_state.last_seek_time = audio_time_ms;
-                
-                // Sync playback time from audio
-                let diff = (playback_state.current_time - audio_time_ms).abs();
-                if diff > 10.0 && diff < 500.0 {
-                    playback_state.current_time = audio_time_ms;
+            // Update last seek time to stay in sync
+            audio_state.last_seek_time = audio_time_ms;
+            
+            // Sync playback time from audio
+            let diff = (playback_state.current_time - audio_time_ms).abs();
+            if diff > 10.0 && diff < 500.0 {
+                playback_state.current_time = audio_time_ms;
+            }
+            
+            // Detect if audio has reached the end
+            if audio_time_ms >= playback_state.total_duration - 100.0 {
+                // Audio finished - stop it and reset for replay
+                if let Some(mut instance) = audio_instances.remove(&instance_handle) {
+                    instance.stop(AudioTween::default());
                 }
-                
-                // Detect if audio has reached the end
-                if audio_time_ms >= playback_state.total_duration - 100.0 {
-                    // Audio finished - reset started flag so it can be restarted
-                    audio_state.started = false;
-                    audio_state.instance = None;
-                    playback_state.state = PlaybackState::Paused;
-                    log::info!("Audio finished, resetting for replay");
-                }
-            } else {
-                // No position available - audio may have stopped
-                // Reset so it can be restarted on next play
                 audio_state.started = false;
                 audio_state.instance = None;
-                log::info!("Audio position unavailable, resetting");
+                playback_state.state = PlaybackState::Paused;
+                log::info!("Audio finished, resetting for replay");
             }
+        } else {
+            // No position available - audio may have stopped
+            // Stop and reset so it can be restarted on next play
+            if let Some(mut instance) = audio_instances.remove(&instance_handle) {
+                instance.stop(AudioTween::default());
+            }
+            audio_state.started = false;
+            audio_state.instance = None;
+            log::info!("Audio position unavailable, resetting");
         }
     }
 }

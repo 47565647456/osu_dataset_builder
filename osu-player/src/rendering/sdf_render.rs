@@ -8,6 +8,7 @@ use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind};
 use crate::playback::PlaybackStateRes;
 use crate::rendering::sdf_materials::{CircleMaterial, CircleUniforms, SliderMaterial, SliderPathData, SliderUniforms};
 use crate::rendering::PlayfieldTransform;
+use crate::ui::UiFont;
 
 /// Marker component for SDF-rendered hit objects
 #[derive(Component)]
@@ -24,9 +25,23 @@ pub struct SliderMesh;
 #[derive(Component)]
 pub struct SliderHeadMesh;
 
+/// Marker for slider tail circle entities
+#[derive(Component)]
+pub struct SliderTailMesh;
+
+/// Marker for slider ball circle entities
+#[derive(Component)]
+pub struct SliderBallMesh;
+
 /// Marker for circle mesh entities  
 #[derive(Component)]
 pub struct CircleMesh;
+
+/// Marker for combo number text entities
+#[derive(Component)]
+pub struct ComboNumberText {
+    pub object_index: usize,
+}
 
 /// Resource to track currently spawned SDF objects
 #[derive(Resource, Default)]
@@ -35,8 +50,14 @@ pub struct SdfRenderState {
     pub spawned_sliders: Vec<usize>,
     /// Indices of currently spawned slider head circles
     pub spawned_slider_heads: Vec<usize>,
+    /// Indices of currently spawned slider tail circles
+    pub spawned_slider_tails: Vec<usize>,
+    /// Indices of currently spawned slider ball circles
+    pub spawned_slider_balls: Vec<usize>,
     /// Indices of currently spawned circle objects
     pub spawned_circles: Vec<usize>,
+    /// Indices of currently spawned combo number texts
+    pub spawned_combo_texts: Vec<usize>,
 }
 
 /// Plugin for SDF rendering system
@@ -63,6 +84,7 @@ fn spawn_sdf_objects(
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
     mut state: ResMut<SdfRenderState>,
+    ui_font: Option<Res<UiFont>>,
 ) {
     // Don't spawn until transform is initialized (first frame has scale = 0)
     if transform.scale <= 0.0 {
@@ -107,6 +129,45 @@ fn spawn_sdf_objects(
                     );
                     state.spawned_slider_heads.push(*idx);
                 }
+                // Spawn slider tail circle
+                if !state.spawned_slider_tails.contains(idx) {
+                    spawn_slider_tail(
+                        &mut commands,
+                        &mut meshes,
+                        &mut circle_materials,
+                        *idx,
+                        obj,
+                        path_points,
+                        radius,
+                        *opacity,
+                        &beatmap,
+                        &transform,
+                    );
+                    state.spawned_slider_tails.push(*idx);
+                }
+                // Spawn slider ball circle
+                if !state.spawned_slider_balls.contains(idx) {
+                    spawn_slider_ball(
+                        &mut commands,
+                        &mut meshes,
+                        &mut circle_materials,
+                        *idx,
+                        obj,
+                        radius,
+                        *opacity,
+                        current_time,
+                        &beatmap,
+                        &transform,
+                    );
+                    state.spawned_slider_balls.push(*idx);
+                }
+                // Spawn combo text for slider
+                if !state.spawned_combo_texts.contains(idx) {
+                    if let Some(ref font) = ui_font {
+                        spawn_combo_text(&mut commands, *idx, obj, radius, &transform, font);
+                        state.spawned_combo_texts.push(*idx);
+                    }
+                }
             }
             RenderObjectKind::Circle => {
                 if !state.spawned_circles.contains(idx) {
@@ -124,12 +185,47 @@ fn spawn_sdf_objects(
                     );
                     state.spawned_circles.push(*idx);
                 }
+                // Spawn combo text for circle
+                if !state.spawned_combo_texts.contains(idx) {
+                    if let Some(ref font) = ui_font {
+                        spawn_combo_text(&mut commands, *idx, obj, radius, &transform, font);
+                        state.spawned_combo_texts.push(*idx);
+                    }
+                }
             }
             RenderObjectKind::Spinner { .. } => {
                 // Spinners use gizmo rendering for now
             }
         }
     }
+}
+
+/// Spawn a combo number text entity
+fn spawn_combo_text(
+    commands: &mut Commands,
+    index: usize,
+    obj: &RenderObject,
+    radius: f32,
+    transform: &PlayfieldTransform,
+    font: &Res<UiFont>,
+) {
+    let pos = transform.osu_to_screen(obj.x, obj.y);
+    let text_size = radius * 0.8;  // Text size relative to circle
+    
+    // Z-ordering: text on very top (above all SDF materials)
+    let z = 0.0 - (index as f32 * 0.0001);  // Slight z variation per object
+    
+    commands.spawn((
+        Text2d::new(obj.combo_number.to_string()),
+        TextFont {
+            font: font.0.clone(),
+            font_size: text_size,
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Transform::from_xyz(pos.x, pos.y, z),
+        ComboNumberText { object_index: index },
+    ));
 }
 
 /// Spawn a slider mesh entity
@@ -217,7 +313,7 @@ fn spawn_slider(
     let material_handle = materials.add(material);
 
     // Z-ordering: later objects should be behind (lower z)
-    let z = -1.0 - (index as f32 * 0.01);
+    let z = -1.0 - (index as f32 * 0.001);
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -254,9 +350,9 @@ fn spawn_slider_head(
     // Get combo color
     let (r, g, b) = beatmap.combo_color(obj);
     
-    // For slider head, we only want the approach circle - make main circle transparent
-    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Fully transparent
-    let border_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Fully transparent (slider body handles the head)
+    // Slider head: visible border circle + approach circle
+    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Transparent body
+    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
     let approach_color = Color::srgba(r, g, b, 1.0);  // Combo color approach ring
 
     let border_width = radius * 0.05;
@@ -277,7 +373,7 @@ fn spawn_slider_head(
     let material_handle = materials.add(material);
 
     // Z-ordering: slider head should be slightly in front of slider body
-    let z = -0.9 - (index as f32 * 0.01);
+    let z = -0.9 - (index as f32 * 0.001);
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -285,6 +381,133 @@ fn spawn_slider_head(
         Transform::from_xyz(pos.x, pos.y, z),
         SdfHitObject { object_index: index },
         SliderHeadMesh,
+    ));
+}
+
+/// Spawn a slider tail circle entity (end cap)
+fn spawn_slider_tail(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<CircleMaterial>>,
+    index: usize,
+    obj: &RenderObject,
+    path_points: &[(f32, f32)],
+    radius: f32,
+    opacity: f32,
+    beatmap: &BeatmapView,
+    transform: &PlayfieldTransform,
+) {
+    // Get tail position from last path point
+    let (tail_x, tail_y) = match path_points.last() {
+        Some(&pos) => pos,
+        None => return,
+    };
+    let pos = transform.osu_to_screen(tail_x, tail_y);
+    
+    // Mesh size for tail circle
+    let max_radius = radius + 10.0;
+    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
+    let mesh_handle = meshes.add(mesh);
+
+    // Get combo color
+    let (r, g, b) = beatmap.combo_color(obj);
+    
+    // Tail circle: visible border, transparent body, no approach circle
+    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Transparent body
+    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
+    let approach_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // No approach circle
+
+    let border_width = radius * 0.05;
+
+    let material = CircleMaterial {
+        uniforms: CircleUniforms {
+            body_color: body_color.into(),
+            border_color: border_color.into(),
+            approach_color: approach_color.into(),
+            radius,
+            border_width,
+            approach_scale: 1.0,  // No approach circle
+            approach_width: 0.0,
+            opacity,
+            center: pos,
+        },
+    };
+    let material_handle = materials.add(material);
+
+    // Z-ordering: tail slightly behind head
+    let z = -0.95 - (index as f32 * 0.001);
+
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
+        Transform::from_xyz(pos.x, pos.y, z),
+        SdfHitObject { object_index: index },
+        SliderTailMesh,
+    ));
+}
+
+/// Spawn a slider ball circle entity
+fn spawn_slider_ball(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<CircleMaterial>>,
+    index: usize,
+    obj: &RenderObject,
+    radius: f32,
+    opacity: f32,
+    current_time: f64,
+    beatmap: &BeatmapView,
+    transform: &PlayfieldTransform,
+) {
+    // Get ball position (or head position if not active yet)
+    let (ball_x, ball_y) = beatmap.slider_ball_position(obj, current_time)
+        .unwrap_or((obj.x, obj.y));
+    let pos = transform.osu_to_screen(ball_x, ball_y);
+    
+    // Ball is smaller than the circle
+    let ball_radius = radius * 0.6;
+    let max_radius = ball_radius + 10.0;
+    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
+    let mesh_handle = meshes.add(mesh);
+
+    // Get combo color
+    let (r, g, b) = beatmap.combo_color(obj);
+    
+    // Ball: solid colored circle
+    let body_color = Color::srgba(r * 0.3, g * 0.3, b * 0.3, 0.8);  // Darker fill
+    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
+    let approach_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // No approach
+
+    let border_width = ball_radius * 0.1;
+
+    // Ball is only visible during active slider
+    let ball_visible = beatmap.slider_ball_position(obj, current_time).is_some();
+    let ball_opacity = if ball_visible { opacity } else { 0.0 };
+
+    let material = CircleMaterial {
+        uniforms: CircleUniforms {
+            body_color: body_color.into(),
+            border_color: border_color.into(),
+            approach_color: approach_color.into(),
+            radius: ball_radius,
+            border_width,
+            approach_scale: 1.0,
+            approach_width: 0.0,
+            opacity: ball_opacity,
+            center: pos,
+        },
+    };
+    let material_handle = materials.add(material);
+
+    // Z-ordering: ball on top
+    let z = -0.5 - (index as f32 * 0.001);
+
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
+        Transform::from_xyz(pos.x, pos.y, z),
+        SdfHitObject { object_index: index },
+        SliderBallMesh,
     ));
 }
 
@@ -339,7 +562,7 @@ fn spawn_circle(
 
 
     // Z-ordering: later objects should be behind (lower z)
-    let z = -1.0 - (index as f32 * 0.01);
+    let z = -1.0 - (index as f32 * 0.001);
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -354,10 +577,13 @@ fn spawn_circle(
 fn update_sdf_materials(
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
+    transform: Res<PlayfieldTransform>,
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
     circle_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<CircleMesh>>,
     slider_head_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderHeadMesh>>,
+    slider_tail_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderTailMesh>>,
+    mut slider_ball_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>, &mut Transform), With<SliderBallMesh>>,
     slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
 ) {
     let current_time = playback.current_time;
@@ -397,6 +623,37 @@ fn update_sdf_materials(
         }
     }
 
+    // Update slider tail circle materials
+    for (hit_obj, material_handle) in slider_tail_query.iter() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
+                material.uniforms.opacity = opacity;
+            }
+        }
+    }
+
+    // Update slider ball materials AND transform position
+    for (hit_obj, material_handle, mut ball_transform) in slider_ball_query.iter_mut() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
+                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
+                    // Update ball position
+                    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, current_time) {
+                        let pos = transform.osu_to_screen(ball_x, ball_y);
+                        material.uniforms.center = pos;
+                        material.uniforms.opacity = opacity;
+                        // Move the mesh quad to follow the ball
+                        ball_transform.translation.x = pos.x;
+                        ball_transform.translation.y = pos.y;
+                    } else {
+                        // Ball not visible (slider not active)
+                        material.uniforms.opacity = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
     // Update slider materials
     for (hit_obj, material_handle) in slider_query.iter() {
         if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
@@ -414,6 +671,7 @@ fn despawn_invisible_objects(
     playback: Res<PlaybackStateRes>,
     mut state: ResMut<SdfRenderState>,
     query: Query<(Entity, &SdfHitObject)>,
+    combo_text_query: Query<(Entity, &ComboNumberText)>,
 ) {
     let current_time = playback.current_time;
     let visible = beatmap.visible_objects(current_time);
@@ -429,7 +687,17 @@ fn despawn_invisible_objects(
             // Remove from state tracking
             state.spawned_sliders.retain(|&i| i != hit_obj.object_index);
             state.spawned_slider_heads.retain(|&i| i != hit_obj.object_index);
+            state.spawned_slider_tails.retain(|&i| i != hit_obj.object_index);
+            state.spawned_slider_balls.retain(|&i| i != hit_obj.object_index);
             state.spawned_circles.retain(|&i| i != hit_obj.object_index);
+        }
+    }
+
+    // Despawn combo texts separately
+    for (entity, combo_text) in combo_text_query.iter() {
+        if !visible_indices.contains(&combo_text.object_index) {
+            commands.entity(entity).despawn();
+            state.spawned_combo_texts.retain(|&i| i != combo_text.object_index);
         }
     }
 }

@@ -1,8 +1,15 @@
 //! Parquet reader utilities for loading dataset
+//! 
+//! This module uses Arrow's filter capabilities to only keep rows that match
+//! the specified folder_id, significantly reducing memory usage.
 
 use anyhow::{Context, Result};
-use arrow::array::{Array, BooleanArray, Float32Array, Float64Array, Int32Array, StringArray};
-use arrow::record_batch::RecordBatch;
+use arrow::array::{
+    Array, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, RecordBatch, StringArray,
+};
+use arrow::compute::kernels::cmp::eq;
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::path::Path;
@@ -22,40 +29,70 @@ impl ParquetReader {
         }
     }
 
-    /// Load the complete dataset from all parquet files
-    pub fn load_all(&self) -> Result<Dataset> {
+    /// Load just the unique folder IDs from beatmaps.parquet
+    /// 
+    /// This is memory-efficient as it reads in batches
+    pub fn load_folder_ids(&self) -> Result<Vec<String>> {
+        let path = self.dataset_path.join("beatmaps.parquet");
+        let file = File::open(&path).context(format!("Failed to open {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let reader = builder.with_batch_size(8192).build()?;
+        
+        let mut ids = std::collections::HashSet::new();
+        for batch_result in reader {
+            let batch = batch_result?;
+            if let Some(col) = batch.column_by_name("folder_id") {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            ids.insert(arr.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        let mut sorted: Vec<String> = ids.into_iter().collect();
+        sorted.sort();
+        Ok(sorted)
+    }
+
+    /// Load dataset for a specific folder only using row-level filtering
+    /// 
+    /// This only loads rows that match the folder_id, using Arrow's filter
+    /// capabilities to minimize memory usage.
+    pub fn load_dataset_for_folder(&self, folder_id: &str) -> Result<Dataset> {
         let mut dataset = Dataset::default();
         
-        dataset.beatmaps = self.load_beatmaps()?;
-        dataset.hit_objects = self.load_hit_objects()?;
-        dataset.timing_points = self.load_timing_points()?;
-        dataset.storyboard_elements = self.load_storyboard_elements()?;
-        dataset.storyboard_commands = self.load_storyboard_commands()?;
-        dataset.slider_control_points = self.load_slider_control_points()?;
-        dataset.slider_data = self.load_slider_data()?;
-        dataset.breaks = self.load_breaks()?;
-        dataset.combo_colors = self.load_combo_colors()?;
-        dataset.hit_samples = self.load_hit_samples()?;
-        dataset.storyboard_loops = self.load_storyboard_loops()?;
-        dataset.storyboard_triggers = self.load_storyboard_triggers()?;
+        dataset.beatmaps = self.load_beatmaps_filtered(folder_id)?;
+        dataset.hit_objects = self.load_hit_objects_filtered(folder_id)?;
+        dataset.timing_points = self.load_timing_points_filtered(folder_id)?;
+        dataset.storyboard_elements = self.load_storyboard_elements_filtered(folder_id)?;
+        dataset.storyboard_commands = self.load_storyboard_commands_filtered(folder_id)?;
+        dataset.slider_control_points = self.load_slider_control_points_filtered(folder_id)?;
+        dataset.slider_data = self.load_slider_data_filtered(folder_id)?;
+        dataset.breaks = self.load_breaks_filtered(folder_id)?;
+        dataset.combo_colors = self.load_combo_colors_filtered(folder_id)?;
+        dataset.hit_samples = self.load_hit_samples_filtered(folder_id)?;
+        dataset.storyboard_loops = self.load_storyboard_loops_filtered(folder_id)?;
+        dataset.storyboard_triggers = self.load_storyboard_triggers_filtered(folder_id)?;
         
         Ok(dataset)
     }
 
-    /// Load beatmaps from beatmaps.parquet
-    pub fn load_beatmaps(&self) -> Result<Vec<BeatmapRow>> {
+    // ============ Filtered loading methods ============
+
+    fn load_beatmaps_filtered(&self, target_folder: &str) -> Result<Vec<BeatmapRow>> {
         let path = self.dataset_path.join("beatmaps.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let format_version = get_i32_array(&batch, "format_version")?;
             let audio_file = get_string_array(&batch, "audio_file")?;
             let audio_lead_in = get_f64_array(&batch, "audio_lead_in")?;
             let preview_time = get_i32_array(&batch, "preview_time")?;
-            // General section - new fields
             let default_sample_bank = get_i32_array(&batch, "default_sample_bank")?;
             let default_sample_volume = get_i32_array(&batch, "default_sample_volume")?;
             let stack_leniency = get_f32_array(&batch, "stack_leniency")?;
@@ -67,13 +104,11 @@ impl ParquetReader {
             let samples_match_playback_rate = get_bool_array(&batch, "samples_match_playback_rate")?;
             let countdown = get_i32_array(&batch, "countdown")?;
             let countdown_offset = get_i32_array(&batch, "countdown_offset")?;
-            // Editor section
             let bookmarks = get_string_array(&batch, "bookmarks")?;
             let distance_spacing = get_f64_array(&batch, "distance_spacing")?;
             let beat_divisor = get_i32_array(&batch, "beat_divisor")?;
             let grid_size = get_i32_array(&batch, "grid_size")?;
             let timeline_zoom = get_f64_array(&batch, "timeline_zoom")?;
-            // Metadata section
             let title = get_string_array(&batch, "title")?;
             let title_unicode = get_string_array(&batch, "title_unicode")?;
             let artist = get_string_array(&batch, "artist")?;
@@ -84,14 +119,12 @@ impl ParquetReader {
             let tags = get_string_array(&batch, "tags")?;
             let beatmap_id = get_i32_array(&batch, "beatmap_id")?;
             let beatmap_set_id = get_i32_array(&batch, "beatmap_set_id")?;
-            // Difficulty section
             let hp_drain_rate = get_f32_array(&batch, "hp_drain_rate")?;
             let circle_size = get_f32_array(&batch, "circle_size")?;
             let overall_difficulty = get_f32_array(&batch, "overall_difficulty")?;
             let approach_rate = get_f32_array(&batch, "approach_rate")?;
             let slider_multiplier = get_f64_array(&batch, "slider_multiplier")?;
             let slider_tick_rate = get_f64_array(&batch, "slider_tick_rate")?;
-            // Events section
             let background_file = get_string_array(&batch, "background_file")?;
             let audio_path = get_string_array(&batch, "audio_path")?;
             let background_path = get_string_array(&batch, "background_path")?;
@@ -145,13 +178,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load hit objects from hit_objects.parquet
-    pub fn load_hit_objects(&self) -> Result<Vec<HitObjectRow>> {
+    fn load_hit_objects_filtered(&self, target_folder: &str) -> Result<Vec<HitObjectRow>> {
         let path = self.dataset_path.join("hit_objects.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let index = get_i32_array(&batch, "index")?;
@@ -187,13 +218,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load timing points from timing_points.parquet
-    pub fn load_timing_points(&self) -> Result<Vec<TimingPointRow>> {
+    fn load_timing_points_filtered(&self, target_folder: &str) -> Result<Vec<TimingPointRow>> {
         let path = self.dataset_path.join("timing_points.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let time = get_f64_array(&batch, "time")?;
@@ -223,13 +252,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load storyboard elements from storyboard_elements.parquet
-    pub fn load_storyboard_elements(&self) -> Result<Vec<StoryboardElementRow>> {
+    fn load_storyboard_elements_filtered(&self, target_folder: &str) -> Result<Vec<StoryboardElementRow>> {
         let path = self.dataset_path.join("storyboard_elements.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let source_file = get_string_array(&batch, "source_file")?;
             let element_index = get_i32_array(&batch, "element_index")?;
@@ -265,13 +292,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load storyboard commands from storyboard_commands.parquet
-    pub fn load_storyboard_commands(&self) -> Result<Vec<StoryboardCommandRow>> {
+    fn load_storyboard_commands_filtered(&self, target_folder: &str) -> Result<Vec<StoryboardCommandRow>> {
         let path = self.dataset_path.join("storyboard_commands.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let source_file = get_string_array(&batch, "source_file")?;
             let element_index = get_i32_array(&batch, "element_index")?;
@@ -301,13 +326,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load slider control points from slider_control_points.parquet
-    pub fn load_slider_control_points(&self) -> Result<Vec<SliderControlPointRow>> {
+    fn load_slider_control_points_filtered(&self, target_folder: &str) -> Result<Vec<SliderControlPointRow>> {
         let path = self.dataset_path.join("slider_control_points.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let hit_object_index = get_i32_array(&batch, "hit_object_index")?;
@@ -331,13 +354,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load slider data from slider_data.parquet
-    pub fn load_slider_data(&self) -> Result<Vec<SliderDataRow>> {
+    fn load_slider_data_filtered(&self, target_folder: &str) -> Result<Vec<SliderDataRow>> {
         let path = self.dataset_path.join("slider_data.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let hit_object_index = get_i32_array(&batch, "hit_object_index")?;
@@ -359,13 +380,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load breaks from breaks.parquet
-    pub fn load_breaks(&self) -> Result<Vec<BreakRow>> {
+    fn load_breaks_filtered(&self, target_folder: &str) -> Result<Vec<BreakRow>> {
         let path = self.dataset_path.join("breaks.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let start_time = get_f64_array(&batch, "start_time")?;
@@ -383,13 +402,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load combo colors from combo_colors.parquet
-    pub fn load_combo_colors(&self) -> Result<Vec<ComboColorRow>> {
+    fn load_combo_colors_filtered(&self, target_folder: &str) -> Result<Vec<ComboColorRow>> {
         let path = self.dataset_path.join("combo_colors.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let color_index = get_i32_array(&batch, "color_index")?;
@@ -415,13 +432,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load hit samples from hit_samples.parquet
-    pub fn load_hit_samples(&self) -> Result<Vec<HitSampleRow>> {
+    fn load_hit_samples_filtered(&self, target_folder: &str) -> Result<Vec<HitSampleRow>> {
         let path = self.dataset_path.join("hit_samples.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let osu_file = get_string_array(&batch, "osu_file")?;
             let hit_object_index = get_i32_array(&batch, "hit_object_index")?;
@@ -447,13 +462,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load storyboard loops from storyboard_loops.parquet
-    pub fn load_storyboard_loops(&self) -> Result<Vec<StoryboardLoopRow>> {
+    fn load_storyboard_loops_filtered(&self, target_folder: &str) -> Result<Vec<StoryboardLoopRow>> {
         let path = self.dataset_path.join("storyboard_loops.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let source_file = get_string_array(&batch, "source_file")?;
             let element_index = get_i32_array(&batch, "element_index")?;
@@ -477,13 +490,11 @@ impl ParquetReader {
         Ok(rows)
     }
 
-    /// Load storyboard triggers from storyboard_triggers.parquet
-    pub fn load_storyboard_triggers(&self) -> Result<Vec<StoryboardTriggerRow>> {
+    fn load_storyboard_triggers_filtered(&self, target_folder: &str) -> Result<Vec<StoryboardTriggerRow>> {
         let path = self.dataset_path.join("storyboard_triggers.parquet");
-        let batches = read_parquet_file(&path)?;
-        
         let mut rows = Vec::new();
-        for batch in batches {
+        
+        for batch in read_filtered_batches(&path, "folder_id", target_folder)? {
             let folder_id = get_string_array(&batch, "folder_id")?;
             let source_file = get_string_array(&batch, "source_file")?;
             let element_index = get_i32_array(&batch, "element_index")?;
@@ -512,13 +523,67 @@ impl ParquetReader {
     }
 }
 
-// ============ Helper functions ============
+// ============ Helper functions with filtering ============
 
-fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>> {
+/// Read parquet file with row-level filtering using Arrow compute
+/// 
+/// This reads the file in batches and filters each batch to only include
+/// rows where the filter_column equals filter_value. This significantly
+/// reduces memory usage compared to loading all rows.
+fn read_filtered_batches(
+    path: &Path,
+    filter_column: &str,
+    filter_value: &str,
+) -> Result<Vec<RecordBatch>> {
     let file = File::open(path).context(format!("Failed to open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-    reader.collect::<Result<Vec<_>, _>>().context("Failed to read parquet batches")
+    
+    // Use smaller batch size to reduce peak memory
+    let reader = builder.with_batch_size(8192).build()?;
+    
+    let mut filtered_batches = Vec::new();
+    
+    for batch_result in reader {
+        let batch = batch_result.context("Failed to read batch")?;
+        
+        // Get the filter column
+        let col = batch
+            .column_by_name(filter_column)
+            .context(format!("Missing column: {}", filter_column))?;
+        
+        // Create filter mask: true where column == filter_value
+        let filter_mask = create_string_eq_filter(col.as_ref(), filter_value)?;
+        
+        // Apply filter - only keep rows where filter_mask is true
+        let filtered = filter_record_batch(&batch, &filter_mask)?;
+        
+        // Only add non-empty batches
+        if filtered.num_rows() > 0 {
+            filtered_batches.push(filtered);
+        }
+    }
+    
+    Ok(filtered_batches)
+}
+
+/// Create a boolean filter mask for string equality comparison
+fn create_string_eq_filter(array: &dyn Array, value: &str) -> Result<BooleanArray> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array.as_string::<i32>();
+            // Create a scalar array filled with the comparison value
+            let scalar = StringArray::from(vec![value; arr.len()]);
+            Ok(eq(arr, &scalar)?)
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_string::<i64>();
+            let scalar = arrow::array::LargeStringArray::from(vec![value; arr.len()]);
+            Ok(eq(arr, &scalar)?)
+        }
+        _ => {
+            anyhow::bail!("Unsupported column type for filtering: {:?}", array.data_type());
+        }
+    }
 }
 
 fn get_string_array<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {

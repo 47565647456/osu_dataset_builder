@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use osu_reconstructor::{ParquetReader, FolderReconstructor};
 
@@ -29,6 +31,10 @@ struct Args {
     /// Limit number of folders to reconstruct (for testing)
     #[arg(long)]
     limit: Option<usize>,
+
+    /// Number of parallel threads (default: 1 for low memory, increase for speed)
+    #[arg(short = 't', long, default_value = "1")]
+    threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -38,61 +44,71 @@ fn main() -> Result<()> {
     println!("Dataset: {}", args.dataset.display());
     println!("Assets: {}", args.assets.display());
     println!("Output: {}", args.output.display());
+    println!("Threads: {}", args.threads);
 
-    // Load dataset
-    println!("\nLoading parquet dataset...");
+    // Configure thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .ok();
+
     let reader = ParquetReader::new(&args.dataset);
-    let dataset = reader.load_all().context("Failed to load dataset")?;
-
-    println!("  Beatmaps: {}", dataset.beatmaps.len());
-    println!("  Hit objects: {}", dataset.hit_objects.len());
-    println!("  Timing points: {}", dataset.timing_points.len());
-    println!("  Storyboard elements: {}", dataset.storyboard_elements.len());
-    println!("  Storyboard commands: {}", dataset.storyboard_commands.len());
-    println!("  Slider control points: {}", dataset.slider_control_points.len());
-    println!("  Slider data: {}", dataset.slider_data.len());
-
-    // Create reconstructor
     let reconstructor = FolderReconstructor::new(&args.assets);
 
     // Determine folder IDs to process
     let folder_ids: Vec<String> = if let Some(ref id) = args.folder_id {
         vec![id.clone()]
     } else {
-        let mut ids = FolderReconstructor::get_folder_ids(&dataset);
+        println!("\nLoading folder IDs...");
+        let mut ids = reader.load_folder_ids().context("Failed to load folder IDs")?;
+        println!("Found {} folders", ids.len());
         if let Some(limit) = args.limit {
             ids.truncate(limit);
         }
         ids
     };
 
-    println!("\nReconstructing {} folder(s)...", folder_ids.len());
+    let total = folder_ids.len();
+    println!("\nReconstructing {} folder(s)...", total);
 
-    let mut success = 0;
-    let mut failed = 0;
+    let success = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
 
-    for folder_id in &folder_ids {
+    folder_ids.par_iter().for_each(|folder_id| {
+        // Each thread creates its own reader for parallel file access
+        let thread_reader = ParquetReader::new(&args.dataset);
+        
+        let dataset = match thread_reader.load_dataset_for_folder(folder_id) {
+            Ok(d) => d,
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("  ✗ {}: Failed to load data: {}", folder_id, e);
+                return;
+            }
+        };
+
         match reconstructor.reconstruct_folder(folder_id, &args.output, &dataset) {
             Ok(result) => {
+                let s = success.fetch_add(1, Ordering::Relaxed) + 1;
                 println!(
-                    "  ✓ {}: {} .osu files, {} storyboard elements, {} assets",
-                    folder_id,
+                    "  [{}/{}] ✓ {}: {} .osu files, {} storyboard elements, {} assets",
+                    s, total, folder_id,
                     result.osu_files.len(),
                     result.storyboard_elements,
                     result.assets_copied
                 );
-                success += 1;
             }
             Err(e) => {
-                println!("  ✗ {}: {}", folder_id, e);
-                failed += 1;
+                failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("  ✗ {}: {}", folder_id, e);
             }
         }
-    }
+        // dataset is dropped here, freeing memory
+    });
 
     println!("\n=== Summary ===");
-    println!("Reconstructed: {}", success);
-    println!("Failed: {}", failed);
+    println!("Reconstructed: {}", success.load(Ordering::Relaxed));
+    println!("Failed: {}", failed.load(Ordering::Relaxed));
 
     Ok(())
 }

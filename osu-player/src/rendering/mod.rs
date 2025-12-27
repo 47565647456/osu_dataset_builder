@@ -68,20 +68,15 @@ fn render_all_objects(
     }
 }
 
-/// Render overlay elements for circles (combo number only - SDF handles the circle itself)
+/// Render overlay elements for circles (currently empty - SDF handles rendering, Text2d handles combo numbers)
 fn render_circle_overlay(
-    gizmos: &mut Gizmos,
-    obj: &crate::beatmap::RenderObject,
-    opacity: f32,
-    radius: f32,
-    transform: &PlayfieldTransform,
+    _gizmos: &mut Gizmos,
+    _obj: &crate::beatmap::RenderObject,
+    _opacity: f32,
+    _radius: f32,
+    _transform: &PlayfieldTransform,
 ) {
-    let pos = transform.osu_to_screen(obj.x, obj.y);
-    
-    // Draw combo number
-    if obj.combo_number > 0 {
-        draw_number_gizmo(gizmos, pos, obj.combo_number, radius * 0.5, opacity);
-    }
+    // Combo numbers are now rendered as Text2d entities in sdf_render.rs
 }
 
 /// Render overlay elements for sliders (combo number, slider ball, arrows)
@@ -92,7 +87,7 @@ fn render_slider_overlay(
     radius: f32,
     current_time: f64,
     transform: &PlayfieldTransform,
-    beatmap: &BeatmapView,
+    _beatmap: &BeatmapView,
 ) {
     let (path_points, repeats, duration) = match &obj.kind {
         RenderObjectKind::Slider { path_points, repeats, duration } => (path_points, *repeats, *duration),
@@ -103,33 +98,8 @@ fn render_slider_overlay(
         return;
     }
 
-    let head_pos = transform.osu_to_screen(obj.x, obj.y);
-    
-    // Get combo color
-    let (r, g, b) = beatmap.combo_color(obj);
-    let combo_color = Color::srgba(r, g, b, opacity);
-
-    // Slider head circle (like a hit circle with outline)
-    gizmos.circle_2d(head_pos, radius, combo_color);
-
-    // Note: Approach circle is now handled by SDF rendering (spawn_slider_head)
-
-    // Draw combo number on slider head
-    if obj.combo_number > 0 {
-        draw_number_gizmo(gizmos, head_pos, obj.combo_number, radius * 0.5, opacity);
-    }
-
-    // Slider ball (during active slider)
-    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, current_time) {
-        let ball_pos = transform.osu_to_screen(ball_x, ball_y);
-        gizmos.circle_2d(ball_pos, radius * 0.6, combo_color);
-    }
-
-    // End cap circle
-    if let Some(&(ex, ey)) = path_points.last() {
-        let end_pos = transform.osu_to_screen(ex, ey);
-        gizmos.circle_2d(end_pos, radius, combo_color);
-    }
+    // Note: Slider head, tail, ball, and combo numbers are now handled by SDF/Text2d rendering
+    // Only reverse arrows use gizmos
 
     // Reverse arrows - show based on which direction the ball will travel next
     // repeats = 0: no repeats (head -> end)

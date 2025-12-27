@@ -13,6 +13,7 @@ impl Plugin for TimelinePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TimelineDensity>()
             .add_systems(Startup, setup_timeline)
+            .add_systems(Update, spawn_timing_markers.run_if(resource_changed::<BeatmapView>))
             .add_systems(Update, compute_density.run_if(resource_changed::<BeatmapView>))
             .add_systems(Update, update_timeline)
             .add_systems(Update, handle_timeline_click);
@@ -54,6 +55,10 @@ pub struct TotalTimeText;
 /// Marker for density bar
 #[derive(Component)]
 pub struct DensityBar(pub usize);
+
+/// Marker for timing point lines
+#[derive(Component)]
+pub struct TimingPointMarker;
 
 fn setup_timeline(mut commands: Commands, ui_font: Res<UiFont>) {
     let font = ui_font.0.clone();
@@ -205,6 +210,50 @@ fn compute_density(beatmap: Res<BeatmapView>, mut density: ResMut<TimelineDensit
         .into_iter()
         .map(|count| count as f32 / max_density)
         .collect();
+}
+
+/// Spawn timing point markers on the timeline
+fn spawn_timing_markers(
+    mut commands: Commands,
+    beatmap: Res<BeatmapView>,
+    track_query: Query<Entity, With<TimelineTrack>>,
+    existing_markers: Query<Entity, With<TimingPointMarker>>,
+) {
+    // Remove existing markers
+    for entity in existing_markers.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    if beatmap.total_duration <= 0.0 {
+        return;
+    }
+
+    // Get the timeline track entity
+    let track_entity = match track_query.iter().next() {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Spawn timing point markers as children of the track
+    commands.entity(track_entity).with_children(|track| {
+        for timing_point in &beatmap.beatmap.control_points.timing_points {
+            let time_ms = timing_point.time;
+            let progress = (time_ms / beatmap.total_duration).clamp(0.0, 1.0) as f32;
+
+            // Spawn a thin red vertical line at this position
+            track.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Px(2.0),
+                    height: Val::Percent(100.0),
+                    left: Val::Percent(progress * 100.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(1.0, 0.3, 0.3)),  // Red for timing points
+                TimingPointMarker,
+            ));
+        }
+    });
 }
 
 fn update_timeline(

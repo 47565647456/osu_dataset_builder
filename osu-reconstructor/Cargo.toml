@@ -20,3 +20,5 @@ rosu-map = { version = "0.2", features = ["tracing"] }
 rosu-storyboard = { version = "0.1" }
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
+rayon = "1"
+

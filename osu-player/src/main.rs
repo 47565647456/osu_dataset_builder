@@ -116,10 +116,18 @@ fn main() -> Result<()> {
         .add_plugins(RenderingPlugin)
         .add_plugins(UiPlugin)
         .add_plugins(InputPlugin)
+        .add_systems(Startup, configure_gizmos)
         .insert_resource(beatmap_view)
         .insert_resource(AudioFilePath(audio_path))
         .insert_resource(BeatmapTitle(title))
         .run();
 
     Ok(())
+}
+
+/// Configure gizmos to render on top of all materials
+fn configure_gizmos(mut config_store: ResMut<GizmoConfigStore>) {
+    let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
+    // Set depth_bias to push gizmos closer to camera
+    config.depth_bias = -1.0;
 }
