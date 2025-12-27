@@ -104,7 +104,6 @@ fn render_slider_overlay(
     }
 
     let head_pos = transform.osu_to_screen(obj.x, obj.y);
-    let time_until_hit = obj.start_time - current_time;
     
     // Get combo color
     let (r, g, b) = beatmap.combo_color(obj);
@@ -113,12 +112,7 @@ fn render_slider_overlay(
     // Slider head circle (like a hit circle with outline)
     gizmos.circle_2d(head_pos, radius, combo_color);
 
-    // Approach circle at slider head (only before hit time)
-    if time_until_hit > 0.0 {
-        let approach_scale = beatmap.approach_scale(obj, current_time);
-        let approach_color = Color::srgba(r, g, b, opacity * 0.9);
-        gizmos.circle_2d(head_pos, radius * approach_scale, approach_color);
-    }
+    // Note: Approach circle is now handled by SDF rendering (spawn_slider_head)
 
     // Draw combo number on slider head
     if obj.combo_number > 0 {

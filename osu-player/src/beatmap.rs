@@ -298,7 +298,7 @@ impl BeatmapView {
             1.0
         } else {
             let progress = (time_until_hit / self.approach_time) as f32;
-            1.0 + progress * 3.0
+            1.0 + progress * 2.5
         }
     }
 

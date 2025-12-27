@@ -20,6 +20,10 @@ pub struct SdfHitObject {
 #[derive(Component)]
 pub struct SliderMesh;
 
+/// Marker for slider head circle entities (for approach circle)
+#[derive(Component)]
+pub struct SliderHeadMesh;
+
 /// Marker for circle mesh entities  
 #[derive(Component)]
 pub struct CircleMesh;
@@ -29,6 +33,8 @@ pub struct CircleMesh;
 pub struct SdfRenderState {
     /// Indices of currently spawned slider objects
     pub spawned_sliders: Vec<usize>,
+    /// Indices of currently spawned slider head circles
+    pub spawned_slider_heads: Vec<usize>,
     /// Indices of currently spawned circle objects
     pub spawned_circles: Vec<usize>,
 }
@@ -84,6 +90,22 @@ fn spawn_sdf_objects(
                         &beatmap,
                     );
                     state.spawned_sliders.push(*idx);
+                }
+                // Spawn slider head circle for approach circle
+                if !state.spawned_slider_heads.contains(idx) {
+                    spawn_slider_head(
+                        &mut commands,
+                        &mut meshes,
+                        &mut circle_materials,
+                        *idx,
+                        obj,
+                        radius,
+                        *opacity,
+                        current_time,
+                        &beatmap,
+                        &transform,
+                    );
+                    state.spawned_slider_heads.push(*idx);
                 }
             }
             RenderObjectKind::Circle => {
@@ -206,6 +228,66 @@ fn spawn_slider(
     ));
 }
 
+/// Spawn a slider head circle entity (for approach circle only)
+fn spawn_slider_head(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<CircleMaterial>>,
+    index: usize,
+    obj: &RenderObject,
+    radius: f32,
+    opacity: f32,
+    current_time: f64,
+    beatmap: &BeatmapView,
+    transform: &PlayfieldTransform,
+) {
+    let pos = transform.osu_to_screen(obj.x, obj.y);
+    
+    // Approach circle scale
+    let approach_scale = beatmap.approach_scale(obj, current_time);
+    
+    // Mesh size needs to cover approach circle at maximum scale
+    let max_radius = radius * approach_scale.max(4.0) + 10.0;
+    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
+    let mesh_handle = meshes.add(mesh);
+
+    // Get combo color
+    let (r, g, b) = beatmap.combo_color(obj);
+    
+    // For slider head, we only want the approach circle - make main circle transparent
+    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Fully transparent
+    let border_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Fully transparent (slider body handles the head)
+    let approach_color = Color::srgba(r, g, b, 1.0);  // Combo color approach ring
+
+    let border_width = radius * 0.05;
+
+    let material = CircleMaterial {
+        uniforms: CircleUniforms {
+            body_color: body_color.into(),
+            border_color: border_color.into(),
+            approach_color: approach_color.into(),
+            radius,
+            border_width,
+            approach_scale,
+            approach_width: 2.5,  // Thin approach circle ring
+            opacity,
+            center: pos,
+        },
+    };
+    let material_handle = materials.add(material);
+
+    // Z-ordering: slider head should be slightly in front of slider body
+    let z = -0.9 - (index as f32 * 0.01);
+
+    commands.spawn((
+        Mesh2d(mesh_handle),
+        MeshMaterial2d(material_handle),
+        Transform::from_xyz(pos.x, pos.y, z),
+        SdfHitObject { object_index: index },
+        SliderHeadMesh,
+    ));
+}
+
 /// Spawn a circle mesh entity
 fn spawn_circle(
     commands: &mut Commands,
@@ -248,7 +330,7 @@ fn spawn_circle(
             radius,
             border_width,
             approach_scale,
-            approach_width: border_width,  // Match approach circle width to border width
+            approach_width: 2.5,  // Thin approach circle ring
             opacity,
             center: pos,
         },
@@ -275,6 +357,7 @@ fn update_sdf_materials(
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
     circle_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<CircleMesh>>,
+    slider_head_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderHeadMesh>>,
     slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
 ) {
     let current_time = playback.current_time;
@@ -293,6 +376,20 @@ fn update_sdf_materials(
                 material.uniforms.opacity = opacity;
                 
                 // Update approach scale
+                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
+                    material.uniforms.approach_scale = beatmap.approach_scale(obj, current_time);
+                }
+            }
+        }
+    }
+
+    // Update slider head circle materials (for approach circles)
+    for (hit_obj, material_handle) in slider_head_query.iter() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
+                material.uniforms.opacity = opacity;
+                
+                // Update approach scale for slider head
                 if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
                     material.uniforms.approach_scale = beatmap.approach_scale(obj, current_time);
                 }
@@ -331,6 +428,7 @@ fn despawn_invisible_objects(
             
             // Remove from state tracking
             state.spawned_sliders.retain(|&i| i != hit_obj.object_index);
+            state.spawned_slider_heads.retain(|&i| i != hit_obj.object_index);
             state.spawned_circles.retain(|&i| i != hit_obj.object_index);
         }
     }
