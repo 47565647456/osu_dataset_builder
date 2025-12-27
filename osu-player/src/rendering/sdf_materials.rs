@@ -4,7 +4,7 @@ use bevy::{
     prelude::*,
     render::render_resource::{AsBindGroup, ShaderType},
     shader::ShaderRef,
-    sprite_render::{Material2d, Material2dPlugin},
+    sprite_render::{Material2d, Material2dPlugin, AlphaMode2d},
 };
 
 /// Material for rendering slider bodies with SDF
@@ -47,6 +47,10 @@ impl Material2d for SliderMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/slider_body.wgsl".into()
     }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
 }
 
 /// Material for rendering hit circles with SDF
@@ -74,6 +78,10 @@ impl Material2d for CircleMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/circle.wgsl".into()
     }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
 }
 
 /// Material for rendering reverse arrows with SDF
@@ -99,6 +107,10 @@ impl Material2d for ArrowMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/arrow.wgsl".into()
     }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
 }
 
 /// Material for rendering spinners with SDF
@@ -123,6 +135,10 @@ pub struct SpinnerUniforms {
 impl Material2d for SpinnerMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/spinner.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
     }
 }
 
@@ -151,6 +167,10 @@ pub struct MsdfUniforms {
 impl Material2d for MsdfMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/msdf_text.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
     }
 }
 

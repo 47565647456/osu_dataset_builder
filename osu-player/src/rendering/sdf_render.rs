@@ -409,7 +409,7 @@ fn spawn_combo_digits(
     transform: &PlayfieldTransform,
 ) {
     let pos = transform.osu_to_screen(obj.x, obj.y);
-    let digit_size = radius * 0.6;  // Size relative to circle
+    let digit_size = radius * 0.5;  // Size relative to circle
     
     // Convert combo number to string to get individual digits
     let combo_str = obj.combo_number.to_string();
@@ -902,12 +902,16 @@ fn update_sdf_materials(
     mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
     mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
+    mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
     circle_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<CircleMesh>>,
     slider_head_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderHeadMesh>>,
     slider_tail_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderTailMesh>>,
     mut slider_ball_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>, &mut Transform), With<SliderBallMesh>>,
     slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
     spinner_query: Query<(&SdfHitObject, &MeshMaterial2d<SpinnerMaterial>), With<SpinnerMesh>>,
+    arrow_query: Query<(&ArrowEntity, &MeshMaterial2d<ArrowMaterial>)>,
+    mut msdf_materials: ResMut<Assets<MsdfMaterial>>,
+    digit_query: Query<(&SdfDigit, &MeshMaterial2d<MsdfMaterial>)>,
 ) {
     let current_time = playback.current_time;
     let visible = beatmap.visible_objects(current_time);
@@ -1001,6 +1005,24 @@ fn update_sdf_materials(
                         material.uniforms.opacity = opacity;
                     }
                 }
+            }
+        }
+    }
+
+    // Update combo digit materials (MSDF)
+    for (digit, material_handle) in digit_query.iter() {
+        if let Some(&opacity) = visible_map.get(&digit.object_index) {
+            if let Some(material) = msdf_materials.get_mut(material_handle.id()) {
+                material.uniforms.opacity = opacity;
+            }
+        }
+    }
+
+    // Update arrow materials
+    for (arrow, material_handle) in arrow_query.iter() {
+        if let Some(&opacity) = visible_map.get(&arrow.object_index) {
+            if let Some(material) = arrow_materials.get_mut(material_handle.id()) {
+                material.uniforms.opacity = opacity;
             }
         }
     }

@@ -114,7 +114,7 @@ fn setup_playfield(
 /// Handle keyboard and mouse wheel input for zoom
 fn handle_zoom_input(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut scroll_events: EventReader<bevy::input::mouse::MouseWheel>,
+    mut scroll_events: MessageReader<bevy::input::mouse::MouseWheel>,
     mut zoom: ResMut<ZoomLevel>,
 ) {
     let zoom_speed = 0.05;

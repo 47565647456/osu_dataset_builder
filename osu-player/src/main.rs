@@ -100,6 +100,7 @@ fn main() -> Result<()> {
                         title: title.clone(),
                         resolution: WindowResolution::new(1280, 720),
                         present_mode: PresentMode::AutoVsync,
+                        // present_mode: PresentMode::Immediate,
                         ..default()
                     }),
                     ..default()
