@@ -22,6 +22,8 @@ pub struct RenderObject {
     pub y: f32,
     /// Combo number (1-indexed within combo)
     pub combo_number: u32,
+    /// Combo color index (0-indexed into combo_colors)
+    pub combo_color_index: usize,
     /// Object-specific data
     pub kind: RenderObjectKind,
 }
@@ -84,6 +86,8 @@ pub struct BeatmapView {
     pub countdown_beat_length: f64,
     /// Total combo count
     pub total_combo: u32,
+    /// Combo colors (RGB values)
+    pub combo_colors: Vec<[u8; 3]>,
 }
 
 impl BeatmapView {
@@ -113,21 +117,39 @@ impl BeatmapView {
             .map(|tp| tp.beat_len)
             .unwrap_or(500.0);
 
+        // Extract combo colors from beatmap (default to white if none specified)
+        let combo_colors: Vec<[u8; 3]> = if beatmap.custom_combo_colors.is_empty() {
+            // Default combo colors similar to osu! defaults
+            vec![
+                [255, 192, 0],   // Orange
+                [0, 202, 0],     // Green
+                [18, 124, 255],  // Blue
+                [242, 24, 57],   // Red
+            ]
+        } else {
+            beatmap.custom_combo_colors.iter()
+                .map(|c| [c.0[0], c.0[1], c.0[2]])
+                .collect()
+        };
+        let combo_color_count = combo_colors.len();
+
         // Process hit objects
         let mut objects = Vec::with_capacity(beatmap.hit_objects.len());
         let mut combo_number = 0u32;
+        let mut combo_color_index = 0usize;
         let mut curve_buffers = CurveBuffers::default();
 
         for hit_object in beatmap.hit_objects.iter_mut() {
-            let is_new_combo = match &hit_object.kind {
-                HitObjectKind::Circle(c) => c.new_combo,
-                HitObjectKind::Slider(s) => s.new_combo,
-                HitObjectKind::Spinner(s) => s.new_combo,
-                HitObjectKind::Hold(_) => false,
+            let (is_new_combo, color_skip) = match &hit_object.kind {
+                HitObjectKind::Circle(c) => (c.new_combo, c.combo_offset as usize),
+                HitObjectKind::Slider(s) => (s.new_combo, s.combo_offset as usize),
+                HitObjectKind::Spinner(s) => (s.new_combo, 0),
+                HitObjectKind::Hold(_) => (false, 0),
             };
 
             if is_new_combo {
                 combo_number = 1;
+                combo_color_index = (combo_color_index + 1 + color_skip) % combo_color_count;
             } else {
                 combo_number += 1;
             }
@@ -139,6 +161,7 @@ impl BeatmapView {
                     x: circle.pos.x,
                     y: circle.pos.y,
                     combo_number,
+                    combo_color_index,
                     kind: RenderObjectKind::Circle,
                 },
                 HitObjectKind::Slider(slider) => {
@@ -164,6 +187,7 @@ impl BeatmapView {
                         x: slider.pos.x,
                         y: slider.pos.y,
                         combo_number,
+                        combo_color_index,
                         kind: RenderObjectKind::Slider {
                             path_points,
                             duration: total_duration,
@@ -179,6 +203,7 @@ impl BeatmapView {
                         x: PLAYFIELD_WIDTH / 2.0,
                         y: PLAYFIELD_HEIGHT / 2.0,
                         combo_number: 0,
+                        combo_color_index: 0,
                         kind: RenderObjectKind::Spinner {
                             duration: spinner.duration,
                         },
@@ -228,6 +253,7 @@ impl BeatmapView {
             first_object_time,
             countdown_beat_length,
             total_combo,
+            combo_colors,
         }
     }
 
@@ -274,6 +300,14 @@ impl BeatmapView {
             let progress = (time_until_hit / self.approach_time) as f32;
             1.0 + progress * 3.0
         }
+    }
+
+    /// Get combo color for a hit object as RGB (0.0-1.0)
+    pub fn combo_color(&self, obj: &RenderObject) -> (f32, f32, f32) {
+        let rgb = self.combo_colors.get(obj.combo_color_index)
+            .copied()
+            .unwrap_or([255, 255, 255]);
+        (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0)
     }
 
     /// Get slider ball position at current time
