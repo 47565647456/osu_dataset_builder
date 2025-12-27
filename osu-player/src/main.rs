@@ -99,7 +99,7 @@ fn main() -> Result<()> {
                     primary_window: Some(Window {
                         title: title.clone(),
                         resolution: WindowResolution::new(1280, 720),
-                        present_mode: PresentMode::AutoNoVsync,
+                        present_mode: PresentMode::AutoVsync,
                         ..default()
                     }),
                     ..default()

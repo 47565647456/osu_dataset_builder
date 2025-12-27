@@ -2,9 +2,6 @@
 
 use bevy::prelude::*;
 
-use crate::beatmap::BeatmapView;
-use crate::rendering::PlayfieldTransform;
-
 pub struct CirclesPlugin;
 
 impl Plugin for CirclesPlugin {
@@ -100,41 +97,5 @@ fn draw_single_digit(gizmos: &mut Gizmos, pos: Vec2, digit: u32, size: f32, alph
     // Segment 6: bottom horizontal
     if segments & 0b1000000 != 0 {
         gizmos.line_2d(pos + Vec2::new(-w, -h), pos + Vec2::new(w, -h), color);
-    }
-}
-
-/// Render a single hit circle
-pub fn render_circle(
-    gizmos: &mut Gizmos,
-    obj: &crate::beatmap::RenderObject,
-    opacity: f32,
-    radius: f32,
-    current_time: f64,
-    transform: &PlayfieldTransform,
-    beatmap: &BeatmapView,
-) {
-    let pos = transform.osu_to_screen(obj.x, obj.y);
-    let alpha = opacity;
-
-    // Main circle outline
-    let circle_color = Color::srgba(1.0, 1.0, 1.0, alpha);
-    gizmos.circle_2d(pos, radius, circle_color);
-
-    // Inner fill (darker)
-    let fill_color = Color::srgba(0.2, 0.2, 0.3, alpha * 0.8);
-    gizmos.circle_2d(pos, radius * 0.9, fill_color);
-
-    // Approach circle
-    let time_until_hit = obj.start_time - current_time;
-    if time_until_hit > 0.0 {
-        let approach_scale = beatmap.approach_scale(obj, current_time);
-        let approach_alpha = alpha * 0.6;
-        let approach_color = Color::srgba(1.0, 1.0, 1.0, approach_alpha);
-        gizmos.circle_2d(pos, radius * approach_scale, approach_color);
-    }
-
-    // Draw combo number
-    if obj.combo_number > 0 {
-        draw_number_gizmo(gizmos, pos, obj.combo_number, radius * 0.5, alpha);
     }
 }

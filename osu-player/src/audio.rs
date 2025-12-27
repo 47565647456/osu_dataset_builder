@@ -140,8 +140,11 @@ fn sync_time_from_audio(
 
     if let Some(instance_handle) = &audio_state.instance {
         if let Some(instance) = audio_instances.get(instance_handle) {
+            // Check if audio has stopped/finished
+            let state = instance.state();
+            
             // Get audio position and sync to playback if available
-            if let Some(position_secs) = instance.state().position() {
+            if let Some(position_secs) = state.position() {
                 let audio_time_ms = position_secs * 1000.0;
                 
                 // Update last seek time to stay in sync
@@ -152,6 +155,21 @@ fn sync_time_from_audio(
                 if diff > 10.0 && diff < 500.0 {
                     playback_state.current_time = audio_time_ms;
                 }
+                
+                // Detect if audio has reached the end
+                if audio_time_ms >= playback_state.total_duration - 100.0 {
+                    // Audio finished - reset started flag so it can be restarted
+                    audio_state.started = false;
+                    audio_state.instance = None;
+                    playback_state.state = PlaybackState::Paused;
+                    log::info!("Audio finished, resetting for replay");
+                }
+            } else {
+                // No position available - audio may have stopped
+                // Reset so it can be restarted on next play
+                audio_state.started = false;
+                audio_state.instance = None;
+                log::info!("Audio position unavailable, resetting");
             }
         }
     }
