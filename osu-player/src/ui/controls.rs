@@ -3,6 +3,7 @@
 use bevy::prelude::*;
 
 use crate::beatmap::BeatmapView;
+use crate::input::SeekConfig;
 use crate::playback::{PlaybackState, PlaybackStateRes};
 use crate::rendering::ZoomLevel;
 use crate::ui::UiFont;
@@ -18,7 +19,9 @@ impl Plugin for ControlsPlugin {
             .add_systems(Update, update_zoom_display)
             .add_systems(Update, handle_button_clicks)
             .add_systems(Update, handle_zoom_clicks)
-            .add_systems(Update, handle_reset_clicks);
+            .add_systems(Update, handle_reset_clicks)
+            .add_systems(Update, update_seek_display)
+            .add_systems(Update, handle_seek_clicks);
     }
 }
 
@@ -58,6 +61,10 @@ pub struct ResetViewButton;
 /// Marker for reverse playback button
 #[derive(Component)]
 pub struct ReverseButton;
+
+/// Marker for seek length button
+#[derive(Component)]
+pub struct SeekButton;
 
 fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Res<UiFont>) {
     let font = ui_font.0.clone();
@@ -161,6 +168,40 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
                 .with_children(|btn| {
                     btn.spawn((
                         Text::new("Reverse"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
+            // Seek label
+            parent.spawn((
+                Text::new("Seek:"),
+                TextFont {
+                    font: font.clone(),
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.7, 0.7, 0.7)),
+            ));
+
+            // Seek length button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    SeekButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("5s"),
                         TextFont {
                             font: font.clone(),
                             font_size: 14.0,
@@ -322,7 +363,7 @@ fn update_play_button(
         for child in children.iter() {
             if let Ok(mut text) = text_query.get_mut(child) {
                 text.0 = match playback.state {
-                    PlaybackState::Playing => "⏸ Pause".to_string(),
+                    PlaybackState::Playing => "|| Pause".to_string(),
                     _ => "▶ Play".to_string(),
                 };
             }
@@ -431,6 +472,31 @@ fn handle_reset_clicks(
             zoom.level = 1.0;
             transform.user_offset = Vec2::ZERO;
             transform.generation = transform.generation.wrapping_add(1);
+        }
+    }
+}
+
+fn update_seek_display(
+    seek_config: Res<SeekConfig>,
+    query: Query<&Children, With<SeekButton>>,
+    mut text_query: Query<&mut Text>,
+) {
+    for children in query.iter() {
+        for child in children.iter() {
+            if let Ok(mut text) = text_query.get_mut(child) {
+                text.0 = seek_config.format_current();
+            }
+        }
+    }
+}
+
+fn handle_seek_clicks(
+    mut seek_config: ResMut<SeekConfig>,
+    query: Query<&Interaction, (Changed<Interaction>, With<SeekButton>)>,
+) {
+    for interaction in query.iter() {
+        if *interaction == Interaction::Pressed {
+            seek_config.cycle_next();
         }
     }
 }

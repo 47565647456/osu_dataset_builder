@@ -59,6 +59,11 @@ fn rotate_by_dir(p: vec2<f32>, dir: vec2<f32>) -> vec2<f32> {
 
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    // Safety check: if direction is zero or size is zero, discard
+    if length(uniforms.direction) < 0.001 || uniforms.size < 0.001 {
+        discard;
+    }
+
     let world_pos = mesh.world_position.xy;
     let rel_pos = world_pos - uniforms.center;
     
