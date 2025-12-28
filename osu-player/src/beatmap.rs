@@ -264,10 +264,28 @@ impl BeatmapView {
         let start = current_time - 200.0;
         let end = current_time + approach;
 
-        self.objects
+        // Binary search to find the first object that could be visible
+        // Objects are sorted by start_time, so we search for the first object
+        // where start_time > start - some buffer for end_time consideration
+        let search_start = start;
+        let first_idx = match self.objects.binary_search_by(|obj| {
+            if obj.start_time < search_start {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1), // Go back one to catch objects that started earlier but might still be visible
+        };
+
+        // Iterate only from the first potentially visible object
+        self.objects[first_idx..]
             .iter()
             .enumerate()
-            .filter(|(_, obj)| obj.start_time <= end && obj.end_time >= start)
+            .map(|(i, obj)| (first_idx + i, obj)) // Adjust index to account for slice offset
+            .take_while(|(_, obj)| obj.start_time <= end) // Stop when objects are too far in the future
+            .filter(|(_, obj)| obj.end_time >= start) // Filter out objects that ended too early
             .filter_map(|(idx, obj)| {
                 let time_until_hit = obj.start_time - current_time;
                 let time_since_end = current_time - obj.end_time;
@@ -401,20 +419,26 @@ impl BeatmapView {
 
     /// Get current combo count at a given time
     pub fn get_current_combo(&self, current_time: f64) -> u32 {
-        let mut combo = 0u32;
-
-        for obj in &self.objects {
-            if obj.end_time > current_time {
-                break;
+        // Binary search to find the first object that ends after current_time
+        let completed_count = match self.objects.binary_search_by(|obj| {
+            if obj.end_time <= current_time {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
             }
+        }) {
+            Ok(idx) => idx,
+            Err(idx) => idx, // idx is the insertion point, which is the count of completed objects
+        };
 
-            combo += match &obj.kind {
+        // Sum combo points for all completed objects
+        self.objects[..completed_count]
+            .iter()
+            .map(|obj| match &obj.kind {
                 RenderObjectKind::Circle => 1,
                 RenderObjectKind::Slider { repeats, .. } => repeats + 2,
                 RenderObjectKind::Spinner { .. } => 1,
-            };
-        }
-
-        combo
+            })
+            .sum()
     }
 }

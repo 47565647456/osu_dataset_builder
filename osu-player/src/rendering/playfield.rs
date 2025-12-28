@@ -70,7 +70,13 @@ pub struct PlayfieldBackground;
 
 /// Setup the 2D camera
 fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d::default());
+    commands.spawn((
+        Camera2d,
+        Projection::Orthographic(OrthographicProjection {
+            far: 20000.0,
+            ..OrthographicProjection::default_2d()
+        }),
+    ));
 }
 
 /// Setup the playfield background
@@ -102,7 +108,7 @@ fn setup_playfield(
     commands.spawn((
         Mesh2d(mesh_handle),
         MeshMaterial2d(material_handle),
-        Transform::from_xyz(0.0, 0.0, -10.0),
+        Transform::from_xyz(0.0, 0.0, -10000.0),
         PlayfieldBackground,
     ));
 
@@ -113,7 +119,7 @@ fn setup_playfield(
             custom_size: Some(Vec2::new(PLAYFIELD_WIDTH + 4.0, PLAYFIELD_HEIGHT + 4.0)),
             ..default()
         },
-        Transform::from_xyz(0.0, 0.0, -11.0),
+        Transform::from_xyz(0.0, 0.0, -10001.0),
     ));
 }
 
@@ -239,9 +245,9 @@ fn update_playfield_transform(
             tf.translation.y = final_offset.y;
         }
 
-        // Update border
+        // Update border (background elements are Z < -100.0)
         for mut tf in border_query.iter_mut() {
-            if tf.translation.z < -10.0 {
+            if tf.translation.z < -100.0 {
                 tf.scale = Vec3::splat(scale);
                 tf.translation.x = transform.user_offset.x;
                 tf.translation.y = final_offset.y;

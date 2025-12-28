@@ -439,8 +439,8 @@ fn spawn_combo_digits(
     // Start X position to center the whole string
     let mut current_x = pos.x - total_width * 0.5;
     
-    // Z-ordering: digits on very top (above all SDF materials)
-    let z = 0.0 - (index as f32 * 0.0001);
+    // Z-ordering: digits on very top of the object slot (+0.0009 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0009;
     
     for ch in combo_str.chars() {
         let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
@@ -529,7 +529,8 @@ fn spawn_arrow(
     let material_handle = materials.add(material);
 
     // Z-ordering: arrows on top of circles but below combo text
-    let z = -0.4 - (index as f32 * 0.001);
+    // Z-ordering: reverse arrows (+0.0005 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0005;
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -580,7 +581,8 @@ fn spawn_spinner(
     let material_handle = materials.add(material);
     
     // Z-ordering: spinner in front (user interacts with it)
-    let z = 0.5 - (index as f32 * 0.001);
+    // Z-ordering: spinner (+0.0000 relative to object base)
+    let z = -(index as f32 * 0.001);
     
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -675,7 +677,8 @@ fn spawn_slider(
     let material_handle = materials.add(material);
 
     // Z-ordering: later objects should be behind (lower z)
-    let z = -1.0 - (index as f32 * 0.001);
+    // Z-ordering: slider body (+0.0000 relative to object base)
+    let z = -(index as f32 * 0.001);
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -735,7 +738,8 @@ fn spawn_slider_head(
     let material_handle = materials.add(material);
 
     // Z-ordering: slider head should be slightly in front of slider body
-    let z = -0.9 - (index as f32 * 0.001);
+    // Z-ordering: slider head (+0.0007 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0007;
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -797,7 +801,8 @@ fn spawn_slider_tail(
     let material_handle = materials.add(material);
 
     // Z-ordering: tail slightly behind head
-    let z = -0.95 - (index as f32 * 0.001);
+    // Z-ordering: slider tail (+0.0003 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0003;
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -862,7 +867,8 @@ fn spawn_slider_ball(
     let material_handle = materials.add(material);
 
     // Z-ordering: ball on top
-    let z = -0.5 - (index as f32 * 0.001);
+    // Z-ordering: slider ball (+0.0007 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0007;
 
     commands.spawn((
         Mesh2d(mesh_handle),
@@ -924,7 +930,8 @@ fn spawn_circle(
 
 
     // Z-ordering: later objects should be behind (lower z)
-    let z = -1.0 - (index as f32 * 0.001);
+    // Z-ordering: circle (+0.0007 relative to object base)
+    let z = -(index as f32 * 0.001) + 0.0007;
 
     commands.spawn((
         Mesh2d(mesh_handle),

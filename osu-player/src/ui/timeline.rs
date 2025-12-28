@@ -190,7 +190,11 @@ fn setup_timeline(mut commands: Commands, ui_font: Res<UiFont>) {
         });
 }
 
-fn compute_density(beatmap: Res<BeatmapView>, mut density: ResMut<TimelineDensity>) {
+fn compute_density(
+    beatmap: Res<BeatmapView>,
+    mut density: ResMut<TimelineDensity>,
+    mut density_query: Query<(&mut Node, &mut BackgroundColor, &DensityBar)>,
+) {
     if beatmap.total_duration <= 0.0 {
         return;
     }
@@ -212,6 +216,18 @@ fn compute_density(beatmap: Res<BeatmapView>, mut density: ResMut<TimelineDensit
         .into_iter()
         .map(|count| count as f32 / max_density)
         .collect();
+
+    // Update density bar heights and colors once when beatmap changes
+    // This avoids updating 100 UI nodes every frame
+    for (mut node, mut bg_color, bar) in density_query.iter_mut() {
+        if let Some(&d) = density.buckets.get(bar.0) {
+            node.height = Val::Percent(d * 100.0);
+            
+            // Color gradient: low = blue, medium = yellow, high = red
+            let color = density_to_color(d);
+            bg_color.0 = color;
+        }
+    }
 }
 
 /// Spawn timing point markers on the timeline
@@ -281,12 +297,10 @@ fn spawn_timing_markers(
 
 fn update_timeline(
     playback: Res<PlaybackStateRes>,
-    density: Res<TimelineDensity>,
     mut current_time_query: Query<&mut Text, (With<CurrentTimeText>, Without<TotalTimeText>)>,
     mut total_time_query: Query<&mut Text, (With<TotalTimeText>, Without<CurrentTimeText>)>,
-    mut progress_query: Query<&mut Node, (With<TimelineProgress>, Without<TimelinePlayhead>, Without<DensityBar>)>,
-    mut playhead_query: Query<&mut Node, (With<TimelinePlayhead>, Without<TimelineProgress>, Without<DensityBar>)>,
-    mut density_query: Query<(&mut Node, &mut BackgroundColor, &DensityBar), (Without<TimelineProgress>, Without<TimelinePlayhead>)>,
+    mut progress_query: Query<&mut Node, (With<TimelineProgress>, Without<TimelinePlayhead>)>,
+    mut playhead_query: Query<&mut Node, (With<TimelinePlayhead>, Without<TimelineProgress>)>,
 ) {
     let progress = playback.progress();
 
@@ -309,16 +323,8 @@ fn update_timeline(
         node.left = Val::Percent((progress * 100.0).max(0.0).min(99.0));
     }
 
-    // Update density bars with color gradient
-    for (mut node, mut bg_color, bar) in density_query.iter_mut() {
-        if let Some(&d) = density.buckets.get(bar.0) {
-            node.height = Val::Percent(d * 100.0);
-            
-            // Color gradient: low = blue, medium = yellow, high = red
-            let color = density_to_color(d);
-            bg_color.0 = color;
-        }
-    }
+    // Note: Density bar heights and colors are now updated in compute_density
+    // (only when beatmap changes) instead of every frame
 }
 
 /// Convert density value (0-1) to a color gradient
