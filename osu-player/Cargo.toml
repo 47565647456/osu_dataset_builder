@@ -28,10 +28,10 @@ serde_json = "1.0.148"
 opt-level = 3
 #opt-level = 'z'
 #opt-level = 1
-#lto = "thin"
+lto = "thin"
 #lto = "fat"
-#strip = true
+strip = true
 
 # comment me out
-#codegen-units = 1
-#panic = "abort"
+codegen-units = 1
+panic = "abort"

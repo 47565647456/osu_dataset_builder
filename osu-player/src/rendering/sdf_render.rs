@@ -7,7 +7,7 @@ use bevy::sprite_render::MeshMaterial2d;
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
 use crate::playback::PlaybackStateRes;
 use crate::rendering::sdf_materials::{
-    ArrowMaterial, ArrowUniforms, CircleMaterial, MsdfMaterial, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms,
+    ArrowMaterial, ArrowUniforms, MsdfMaterial, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms,
     CircleBatchMaterial, MsdfBatchMaterial,
     ATTRIBUTE_BODY_COLOR, ATTRIBUTE_BORDER_COLOR, ATTRIBUTE_APPROACH_COLOR, ATTRIBUTE_SDF_PARAMS,
     ATTRIBUTE_MSDF_UV_BOUNDS, ATTRIBUTE_MSDF_PARAMS
@@ -29,37 +29,17 @@ pub struct SdfHitObject {
 pub struct SliderMesh;
 
 /// Marker for slider head circle entities (for approach circle)
-#[derive(Component)]
-pub struct SliderHeadMesh;
-
-/// Marker for slider tail circle entities
-#[derive(Component)]
-pub struct SliderTailMesh;
-
-/// Marker for slider ball circle entities
-#[derive(Component)]
-pub struct SliderBallMesh;
-
-/// Marker for circle mesh entities  
-#[derive(Component)]
-pub struct CircleMesh;
+// (Marker structs removed as hit circles are now batched entity-less)
 
 /// Marker for arrow mesh entities
 #[derive(Component)]
 pub struct ArrowMesh;
 
-/// Which position an arrow is placed at
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ArrowPosition {
-    Start,
-    End,
-}
 
 /// Component tracking arrow entity data
 #[derive(Component)]
 pub struct ArrowEntity {
     pub object_index: usize,
-    pub position: ArrowPosition,
 }
 
 /// Marker for spinner mesh entities
@@ -333,7 +313,7 @@ fn spawn_sdf_objects(
                         let end_pos = transform.osu_to_screen(end.0, end.1);
                         let prev_pos = transform.osu_to_screen(prev.0, prev.1);
                         let direction = prev_pos - end_pos;
-                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, ArrowPosition::End, end_pos, direction, radius * 0.6, *opacity);
+                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, end_pos, direction, radius * 0.6, *opacity);
                         state.spawned_end_arrows.push(*idx);
                     }
                     if *repeats >= 2 && !state.spawned_start_arrows.contains(idx) {
@@ -342,7 +322,7 @@ fn spawn_sdf_objects(
                         let start_pos = transform.osu_to_screen(start.0, start.1);
                         let next_pos = transform.osu_to_screen(next.0, next.1);
                         let direction = next_pos - start_pos;
-                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, ArrowPosition::Start, start_pos, direction, radius * 0.6, *opacity);
+                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, start_pos, direction, radius * 0.6, *opacity);
                         state.spawned_start_arrows.push(*idx);
                     }
                 }
@@ -444,24 +424,18 @@ fn update_non_batched_materials(
     }
 }
 
-/// Spawn a reverse arrow entity at a slider endpoint
 fn spawn_arrow(
     commands: &mut Commands,
     state: &mut SdfRenderState,
     materials: &mut ResMut<Assets<ArrowMaterial>>,
     index: usize,
-    position: ArrowPosition,
-    arrow_pos: Vec2,
+    pos: Vec2,
     direction: Vec2,  // Direction arrow points toward
-    size: f32,
+    radius: f32,
     opacity: f32,
 ) {
     // Z-ordering: reverse arrows (+0.0005 relative to object base)
     let z = -(index as f32 * 0.001) + 0.0005;
-
-    // Calculate rotation to match direction (which currently points toward the "tip")
-    // Our shader chevron points right (+X)
-    let angle = direction.y.atan2(direction.x);
     
     // Use cache for arrow material
     let _opacity_bits = opacity.to_bits();
@@ -479,11 +453,11 @@ fn spawn_arrow(
     commands.spawn((
         Mesh2d(state.unit_mesh.clone()),
         MeshMaterial2d(material_handle),
-        Transform::from_xyz(arrow_pos.x, arrow_pos.y, z)
-            .with_rotation(Quat::from_rotation_z(angle))
-            .with_scale(Vec3::new(size * 3.0, size * 3.0, 1.0)), // Mesh size was size * 3.0
+        Transform::from_xyz(pos.x, pos.y, z)
+            .with_rotation(Quat::from_rotation_arc(Vec3::Y, direction.extend(0.0).normalize()))
+            .with_scale(Vec3::new(radius * 2.0, radius * 2.0, 1.0)),
         ArrowMesh,
-        ArrowEntity { object_index: index, position },
+        ArrowEntity { object_index: index },
     ));
 }
 
@@ -665,7 +639,6 @@ fn update_circle_batches(
             let (r, g, b) = beatmap.combo_color(obj);
             let combo_color = LinearRgba::new(r, g, b, 1.0);
             let body_color = LinearRgba::new(r, g, b, 0.3 * opacity);
-            let border_color = LinearRgba::new(1.0, 1.0, 1.0, 1.0);
             let white_color = LinearRgba::new(1.0, 1.0, 1.0, 1.0).to_f32_array();
             let approach_color = combo_color.to_f32_array();
 

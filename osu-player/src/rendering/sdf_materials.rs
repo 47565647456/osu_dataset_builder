@@ -1,7 +1,6 @@
 use bevy::prelude::*;
-use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef};
-use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError, VertexFormat};
+use bevy::render::render_resource::{AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError, VertexFormat};
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 
