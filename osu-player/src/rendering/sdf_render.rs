@@ -6,8 +6,16 @@ use bevy::sprite_render::MeshMaterial2d;
 
 use crate::beatmap::{BeatmapView, RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
 use crate::playback::PlaybackStateRes;
-use crate::rendering::sdf_materials::{ArrowMaterial, ArrowUniforms, CircleMaterial, CircleUniforms, MsdfMaterial, MsdfUniforms, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms};
+use crate::rendering::sdf_materials::{
+    ArrowMaterial, ArrowUniforms, CircleMaterial, MsdfMaterial, SliderMaterial, SliderPathData, SliderUniforms, SpinnerMaterial, SpinnerUniforms,
+    CircleBatchMaterial, MsdfBatchMaterial,
+    ATTRIBUTE_BODY_COLOR, ATTRIBUTE_BORDER_COLOR, ATTRIBUTE_APPROACH_COLOR, ATTRIBUTE_SDF_PARAMS,
+    ATTRIBUTE_MSDF_UV_BOUNDS, ATTRIBUTE_MSDF_PARAMS
+};
 use crate::rendering::PlayfieldTransform;
+use bevy::render::render_resource::PrimitiveTopology;
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::Indices;
 
 /// Marker component for SDF-rendered hit objects
 #[derive(Component)]
@@ -36,12 +44,6 @@ pub struct SliderBallMesh;
 #[derive(Component)]
 pub struct CircleMesh;
 
-/// Marker for SDF digit mesh entities (combo numbers)
-#[derive(Component)]
-pub struct SdfDigit {
-    pub object_index: usize,
-}
-
 /// Marker for arrow mesh entities
 #[derive(Component)]
 pub struct ArrowMesh;
@@ -64,29 +66,58 @@ pub struct ArrowEntity {
 #[derive(Component)]
 pub struct SpinnerMesh;
 
-/// Resource to track currently spawned SDF objects
-#[derive(Resource, Default)]
+/// Resource to track currently spawned SDF objects and shared resources
+#[derive(Resource)]
 pub struct SdfRenderState {
+    /// Shared unit quad mesh (1x1)
+    pub unit_mesh: Handle<Mesh>,
+    /// Mesh for batched circles (updated every frame)
+    pub circle_batch_mesh: Handle<Mesh>,
+    /// Mesh for batched MSDF digits (updated every frame)
+    pub msdf_batch_mesh: Handle<Mesh>,
+    
+    /// Cache for shared arrow materials by opacity
+    pub arrow_cache: std::collections::HashMap<u32, Handle<ArrowMaterial>>,
+    
     /// Indices of currently spawned slider objects
     pub spawned_sliders: Vec<usize>,
-    /// Indices of currently spawned slider head circles
-    pub spawned_slider_heads: Vec<usize>,
-    /// Indices of currently spawned slider tail circles
-    pub spawned_slider_tails: Vec<usize>,
-    /// Indices of currently spawned slider ball circles
-    pub spawned_slider_balls: Vec<usize>,
-    /// Indices of currently spawned circle objects
-    pub spawned_circles: Vec<usize>,
-    /// Indices of currently spawned combo number texts
-    pub spawned_combo_texts: Vec<usize>,
     /// Indices of sliders with spawned end arrows
     pub spawned_end_arrows: Vec<usize>,
     /// Indices of sliders with spawned start arrows
     pub spawned_start_arrows: Vec<usize>,
     /// Indices of currently spawned spinners
     pub spawned_spinners: Vec<usize>,
+    /// Current vertex capacity for circle batch (number of quads)
+    pub circle_capacity: usize,
+    /// Current vertex capacity for MSDF batch (number of quads)
+    pub msdf_capacity: usize,
     /// Last seen transform generation (for detecting resize/zoom changes)
     pub last_generation: u32,
+}
+
+impl FromWorld for SdfRenderState {
+    fn from_world(world: &mut World) -> Self {
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        let unit_mesh = meshes.add(Mesh::from(Rectangle::new(1.0, 1.0)));
+        
+        // Create empty meshes for batching
+        let circle_batch_mesh = meshes.add(Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default()));
+        let msdf_batch_mesh = meshes.add(Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default()));
+
+        Self {
+            unit_mesh,
+            circle_batch_mesh,
+            msdf_batch_mesh,
+            arrow_cache: default(),
+            spawned_sliders: default(),
+            spawned_end_arrows: default(),
+            spawned_start_arrows: default(),
+            spawned_spinners: default(),
+            circle_capacity: 0,
+            msdf_capacity: 0,
+            last_generation: 0,
+        }
+    }
 }
 use serde::Deserialize;
 
@@ -146,14 +177,52 @@ impl Plugin for SdfRenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SdfRenderState>()
             .init_resource::<MsdfAtlas>()
-            .add_systems(Startup, setup_msdf_atlas)
+            .add_systems(Startup, (setup_msdf_atlas, setup_batch_entities).chain())
             .add_systems(Update, (
                 clear_on_transform_change,
                 spawn_sdf_objects,
-                update_sdf_materials,
+                update_non_batched_materials,
                 despawn_invisible_objects,
-            ).chain());
+            ).chain())
+            .add_systems(PostUpdate, (
+                update_circle_batches,
+                update_msdf_batches,
+            ).after(bevy::transform::TransformSystems::Propagate));
     }
+}
+
+/// Helper components for batch entities
+#[derive(Component)]
+pub struct CircleBatchMarker;
+#[derive(Component)]
+pub struct MsdfBatchMarker;
+
+/// Spawn the persistent batch entities
+fn setup_batch_entities(
+    mut commands: Commands,
+    state: Res<SdfRenderState>,
+    mut circle_batch_materials: ResMut<Assets<CircleBatchMaterial>>,
+    mut msdf_batch_materials: ResMut<Assets<MsdfBatchMaterial>>,
+    atlas: Res<MsdfAtlas>,
+) {
+    commands.spawn((
+        Mesh2d(state.circle_batch_mesh.clone()),
+        MeshMaterial2d(circle_batch_materials.add(CircleBatchMaterial::default())),
+        CircleBatchMarker,
+        Transform::from_xyz(0.0, 0.0, 0.1), // Slightly in front
+        Visibility::Visible,
+    ));
+
+    commands.spawn((
+        Mesh2d(state.msdf_batch_mesh.clone()),
+        MeshMaterial2d(msdf_batch_materials.add(MsdfBatchMaterial {
+            uniforms: default(),
+            texture: atlas.texture.clone(),
+        })),
+        MsdfBatchMarker,
+        Transform::from_xyz(0.0, 0.0, 0.5), // High Z for digits overlay
+        Visibility::Visible,
+    ));
 }
 
 /// Load MSDF atlas texture and JSON metadata at startup
@@ -176,19 +245,18 @@ fn setup_msdf_atlas(
                     let index = (glyph.unicode - 48) as usize;
                     if let Some(bounds) = glyph.atlas_bounds {
                         // Convert to normalized UV coordinates (0-1)
-                        // msdf-atlas-gen uses bottom-up Y origin, but GPU textures use top-down Y
-                        // So we need to flip the Y coordinates
+                        // JSON is yOrigin: bottom (Y-up), so we need to flip for GPU (Top-Down)
                         atlas.digit_uvs[index] = Vec4::new(
                             bounds.left / width,
-                            1.0 - (bounds.top / height),      // Flip Y
+                            1.0 - (bounds.top / height),      // Top edge in Y-up is small Y in Top-Down
                             bounds.right / width,
-                            1.0 - (bounds.bottom / height)    // Flip Y
+                            1.0 - (bounds.bottom / height)    // Bottom edge in Y-up is large Y in Top-Down
                         );
 
                         // Calculate aspect ratio from atlas bounds
                         let w = bounds.right - bounds.left;
-                        let h = bounds.top - bounds.bottom;
-                        let aspect = if h > 0.0 { w / h } else { 1.0 };
+                        let h = (bounds.top - bounds.bottom).abs();
+                        let aspect = if h > 0.001 { w / h } else { 1.0 };
                         atlas.digit_sizes[index] = Vec2::new(aspect, 1.0);
                     }
                     atlas.digit_advances[index] = glyph.advance;
@@ -212,28 +280,15 @@ fn clear_on_transform_change(
     mut commands: Commands,
     transform: Res<PlayfieldTransform>,
     mut state: ResMut<SdfRenderState>,
-    sdf_query: Query<Entity, With<SdfHitObject>>,
-    digit_query: Query<Entity, With<SdfDigit>>,
-    arrow_query: Query<Entity, With<ArrowEntity>>,
+    query: Query<Entity, Or<(With<SdfHitObject>, With<ArrowEntity>)>>,
 ) {
     if state.last_generation != transform.generation {
         // Transform changed - despawn all and clear state
-        for entity in sdf_query.iter() {
-            commands.entity(entity).despawn();
-        }
-        for entity in digit_query.iter() {
-            commands.entity(entity).despawn();
-        }
-        for entity in arrow_query.iter() {
+        for entity in query.iter() {
             commands.entity(entity).despawn();
         }
         
         state.spawned_sliders.clear();
-        state.spawned_slider_heads.clear();
-        state.spawned_slider_tails.clear();
-        state.spawned_slider_balls.clear();
-        state.spawned_circles.clear();
-        state.spawned_combo_texts.clear();
         state.spawned_end_arrows.clear();
         state.spawned_start_arrows.clear();
         state.spawned_spinners.clear();
@@ -244,18 +299,17 @@ fn clear_on_transform_change(
 /// Spawn SDF mesh entities for newly visible objects
 fn spawn_sdf_objects(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut slider_materials: ResMut<Assets<SliderMaterial>>,
-    mut circle_materials: ResMut<Assets<CircleMaterial>>,
     mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
     mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
-    mut msdf_materials: ResMut<Assets<MsdfMaterial>>,
-    atlas: Res<MsdfAtlas>,
+    _msdf_materials: ResMut<Assets<MsdfMaterial>>, // Keep for potential future use or if other MSDF entities are added
+    _atlas: Res<MsdfAtlas>, // Keep for potential future use
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
-    mut state: ResMut<SdfRenderState>,
+    mut state_res: ResMut<SdfRenderState>,
 ) {
+    let state = &mut *state_res;
     // Don't spawn until transform is initialized (first frame has scale = 0)
     if transform.scale <= 0.0 {
         return;
@@ -269,140 +323,34 @@ fn spawn_sdf_objects(
         match &obj.kind {
         RenderObjectKind::Slider { path_points, repeats, .. } => {
                 if !state.spawned_sliders.contains(idx) {
-                    spawn_slider(
-                        &mut commands,
-                        &mut meshes,
-                        &mut slider_materials,
-                        *idx,
-                        obj,
-                        path_points,
-                        radius,
-                        *opacity,
-                        &transform,
-                        &beatmap,
-                    );
+                    spawn_slider(&mut commands, state, &mut slider_materials, *idx, obj, path_points, radius, *opacity, &transform, &beatmap);
                     state.spawned_sliders.push(*idx);
                 }
-                // Spawn slider head circle for approach circle
-                if !state.spawned_slider_heads.contains(idx) {
-                    spawn_slider_head(
-                        &mut commands,
-                        &mut meshes,
-                        &mut circle_materials,
-                        *idx,
-                        obj,
-                        radius,
-                        *opacity,
-                        current_time,
-                        &beatmap,
-                        &transform,
-                    );
-                    state.spawned_slider_heads.push(*idx);
-                }
-                // Spawn slider tail circle
-                if !state.spawned_slider_tails.contains(idx) {
-                    spawn_slider_tail(
-                        &mut commands,
-                        &mut meshes,
-                        &mut circle_materials,
-                        *idx,
-                        obj,
-                        path_points,
-                        radius,
-                        *opacity,
-                        &beatmap,
-                        &transform,
-                    );
-                    state.spawned_slider_tails.push(*idx);
-                }
-                // Spawn slider ball circle
-                if !state.spawned_slider_balls.contains(idx) {
-                    spawn_slider_ball(
-                        &mut commands,
-                        &mut meshes,
-                        &mut circle_materials,
-                        *idx,
-                        obj,
-                        radius,
-                        *opacity,
-                        current_time,
-                        &beatmap,
-                        &transform,
-                    );
-                    state.spawned_slider_balls.push(*idx);
-                }
-                // Spawn SDF digits for slider combo number
-                if !state.spawned_combo_texts.contains(idx) {
-                    spawn_combo_digits(&mut commands, &mut meshes, &mut msdf_materials, &atlas, *idx, obj, radius, *opacity, &transform);
-                    state.spawned_combo_texts.push(*idx);
-                }
-                // Spawn arrows for sliders with repeats
                 if *repeats > 0 && path_points.len() >= 2 {
-                    // End arrow (pointing toward start)
                     if !state.spawned_end_arrows.contains(idx) {
                         let end = path_points.last().unwrap();
                         let prev = &path_points[path_points.len() - 2];
                         let end_pos = transform.osu_to_screen(end.0, end.1);
                         let prev_pos = transform.osu_to_screen(prev.0, prev.1);
-                        let direction = prev_pos - end_pos;  // Points toward start
-                        spawn_arrow(
-                            &mut commands, &mut meshes, &mut arrow_materials,
-                            *idx, ArrowPosition::End, end_pos, direction,
-                            radius * 0.6, *opacity,
-                        );
+                        let direction = prev_pos - end_pos;
+                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, ArrowPosition::End, end_pos, direction, radius * 0.6, *opacity);
                         state.spawned_end_arrows.push(*idx);
                     }
-                    // Start arrow (pointing toward end) - only for 2+ repeats
                     if *repeats >= 2 && !state.spawned_start_arrows.contains(idx) {
                         let start = &path_points[0];
                         let next = &path_points[1];
                         let start_pos = transform.osu_to_screen(start.0, start.1);
                         let next_pos = transform.osu_to_screen(next.0, next.1);
-                        let direction = next_pos - start_pos;  // Points toward end
-                        spawn_arrow(
-                            &mut commands, &mut meshes, &mut arrow_materials,
-                            *idx, ArrowPosition::Start, start_pos, direction,
-                            radius * 0.6, *opacity,
-                        );
+                        let direction = next_pos - start_pos;
+                        spawn_arrow(&mut commands, state, &mut arrow_materials, *idx, ArrowPosition::Start, start_pos, direction, radius * 0.6, *opacity);
                         state.spawned_start_arrows.push(*idx);
                     }
                 }
             }
-            RenderObjectKind::Circle => {
-                if !state.spawned_circles.contains(idx) {
-                    spawn_circle(
-                        &mut commands,
-                        &mut meshes,
-                        &mut circle_materials,
-                        *idx,
-                        obj,
-                        radius,
-                        *opacity,
-                        current_time,
-                        &beatmap,
-                        &transform,
-                    );
-                    state.spawned_circles.push(*idx);
-                }
-                // Spawn SDF digits for circle combo number
-                if !state.spawned_combo_texts.contains(idx) {
-                    spawn_combo_digits(&mut commands, &mut meshes, &mut msdf_materials, &atlas, *idx, obj, radius, *opacity, &transform);
-                    state.spawned_combo_texts.push(*idx);
-                }
-            }
+            RenderObjectKind::Circle => {}
             RenderObjectKind::Spinner { duration } => {
                 if !state.spawned_spinners.contains(idx) {
-                    spawn_spinner(
-                        &mut commands,
-                        &mut meshes,
-                        &mut spinner_materials,
-                        *idx,
-                        obj,
-                        *duration,
-                        *opacity,
-                        current_time,
-                        &transform,
-                    );
+                    spawn_spinner(&mut commands, state, &mut spinner_materials, *idx, obj, *duration, *opacity, current_time, &transform);
                     state.spawned_spinners.push(*idx);
                 }
             }
@@ -410,98 +358,96 @@ fn spawn_sdf_objects(
     }
 }
 
-/// Spawn MSDF digit mesh entities for combo number  
-fn spawn_combo_digits(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<MsdfMaterial>>,
-    atlas: &MsdfAtlas,
-    index: usize,
-    obj: &RenderObject,
-    radius: f32,
-    opacity: f32,
-    transform: &PlayfieldTransform,
+/// Despawn objects that are no longer visible
+fn despawn_invisible_objects(
+    mut commands: Commands,
+    beatmap: Res<BeatmapView>,
+    playback: Res<PlaybackStateRes>,
+    mut state: ResMut<SdfRenderState>,
+    query: Query<(Entity, &SdfHitObject)>,
+    arrow_query: Query<(Entity, &ArrowEntity)>,
 ) {
-    let pos = transform.osu_to_screen(obj.x, obj.y);
-    let digit_size = radius * 0.5;  // Size relative to circle
-    
-    // Convert combo number to string to get individual digits
-    let combo_str = obj.combo_number.to_string();
-    
-    // Calculate total width using actual advances
-    let mut total_width = 0.0;
-    for ch in combo_str.chars() {
-        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
-        let advance = atlas.digit_advances.get(digit_value).copied().unwrap_or(0.5);
-        total_width += advance * digit_size;
+    let current_time = playback.current_time;
+    let visible = beatmap.visible_objects(current_time);
+    let visible_indices: std::collections::HashSet<usize> = visible
+        .iter()
+        .map(|(idx, _, _)| *idx)
+        .collect();
+
+    for (entity, hit_obj) in query.iter() {
+        if !visible_indices.contains(&hit_obj.object_index) {
+            commands.entity(entity).despawn();
+            
+            // Remove from state tracking
+            state.spawned_sliders.retain(|&i| i != hit_obj.object_index);
+            state.spawned_spinners.retain(|&i| i != hit_obj.object_index);
+        }
     }
-    
-    // Start X position to center the whole string
-    let mut current_x = pos.x - total_width * 0.5;
-    
-    // Z-ordering: digits on very top of the object slot (+0.0009 relative to object base)
-    let z = -(index as f32 * 0.001) + 0.0009;
-    
-    for ch in combo_str.chars() {
-        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
-        
-        let advance = atlas.digit_advances.get(digit_value).copied().unwrap_or(0.5);
-        let size_ratio = atlas.digit_sizes.get(digit_value).copied().unwrap_or(Vec2::ONE);
-        
-        // Use aspect ratio to size the mesh width
-        let glyph_width = digit_size * size_ratio.x;
-        let glyph_height = digit_size; // Height is constant based on font size
 
-        // Center the glyph within its advance width
-        // Advance is usually slightly larger than glyph width for spacing
-        // We position the center of the glyph
-        let advance_width = advance * digit_size;
-        let digit_center_x = current_x + advance_width * 0.5;
-        
-        // Create mesh matching the glyph aspect ratio
-        // Add 20% padding to height to match previous tweaking/visuals if needed, 
-        // but strictly following bounds is better. Keeping 1.2 multiplier for now as in original code
-        // Update: Original code used digit_size * 1.2 for height. Let's stick to base height radius*0.5 
-        // but we might need to adjust scale if it looks too small.
-        // The original code:
-        // let digit_size = radius * 0.5; 
-        // let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size * 1.2));
-        
-        // New approach: width = glyph_width, height = glyph_height * 1.2 (to allow for ascenders/descenders visual padding)
-        let mesh = Mesh::from(Rectangle::new(glyph_width, glyph_height * 1.2)); 
-        let mesh_handle = meshes.add(mesh);
-        
-        // Get UV bounds for this digit from the atlas (use digit 0 as fallback)
-        let uv_bounds = atlas.digit_uvs.get(digit_value).copied().unwrap_or(atlas.digit_uvs[0]);
-        
-        let material = MsdfMaterial {
-            uniforms: MsdfUniforms {
-                color: Color::WHITE.into(),
-                uv_bounds,
-                opacity,
-                px_range: atlas.px_range,
-                _padding: Vec2::ZERO,
-            },
-            texture: atlas.texture.clone(),
-        };
-        let material_handle = materials.add(material);
-        
-        commands.spawn((
-            Mesh2d(mesh_handle),
-            MeshMaterial2d(material_handle),
-            Transform::from_xyz(digit_center_x, pos.y, z),
-            SdfDigit { object_index: index },
-        ));
+    // Despawn arrows separately
+    for (entity, arrow) in arrow_query.iter() {
+        if !visible_indices.contains(&arrow.object_index) {
+            commands.entity(entity).despawn();
+            state.spawned_end_arrows.retain(|&i| i != arrow.object_index);
+            state.spawned_start_arrows.retain(|&i| i != arrow.object_index);
+        }
+    }
+}
 
-        // Advance cursor
-        current_x += advance_width;
+/// Update materials for non-batched items (Spinners, Slider Bodies, Arrows)
+fn update_non_batched_materials(
+    beatmap: Res<BeatmapView>,
+    playback: Res<PlaybackStateRes>,
+    mut slider_materials: ResMut<Assets<SliderMaterial>>,
+    mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
+    mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
+    slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
+    spinner_query: Query<(&SdfHitObject, &MeshMaterial2d<SpinnerMaterial>), With<SpinnerMesh>>,
+    arrow_query: Query<(&ArrowEntity, &MeshMaterial2d<ArrowMaterial>)>,
+) {
+    let current_time = playback.current_time;
+    let visible = beatmap.visible_objects(current_time);
+    let visible_map: std::collections::HashMap<usize, f32> = visible
+        .iter()
+        .map(|(idx, _, opacity)| (*idx, *opacity))
+        .collect();
+
+    for (hit_obj, handle) in slider_query.iter() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(mat) = slider_materials.get_mut(handle.id()) {
+                mat.uniforms.opacity = opacity;
+            }
+        }
+    }
+
+    for (hit_obj, handle) in spinner_query.iter() {
+        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
+            if let Some(mat) = spinner_materials.get_mut(handle.id()) {
+                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
+                    if let RenderObjectKind::Spinner { duration } = &obj.kind {
+                        let elapsed = (current_time - obj.start_time).max(0.0);
+                        mat.uniforms.progress = (elapsed / duration).min(1.0) as f32;
+                        mat.uniforms.rotation = (current_time / 50.0).to_radians() as f32;
+                        mat.uniforms.opacity = opacity;
+                    }
+                }
+            }
+        }
+    }
+
+    for (arrow, handle) in arrow_query.iter() {
+        if let Some(&opacity) = visible_map.get(&arrow.object_index) {
+            if let Some(mat) = arrow_materials.get_mut(handle.id()) {
+                mat.uniforms.opacity = opacity;
+            }
+        }
     }
 }
 
 /// Spawn a reverse arrow entity at a slider endpoint
 fn spawn_arrow(
     commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
+    state: &mut SdfRenderState,
     materials: &mut ResMut<Assets<ArrowMaterial>>,
     index: usize,
     position: ArrowPosition,
@@ -510,32 +456,32 @@ fn spawn_arrow(
     size: f32,
     opacity: f32,
 ) {
-    // Create square mesh for arrow
-    let mesh_size = size * 3.0;  // Mesh needs to be larger than arrow
-    let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
-    let mesh_handle = meshes.add(mesh);
-
-    let material = ArrowMaterial {
-        uniforms: ArrowUniforms {
-            color: Color::WHITE.into(),
-            center: arrow_pos,
-            size,
-            direction: direction.normalize_or_zero(),
-            thickness: size * 0.03,
-            opacity,
-            _padding: Vec2::ZERO,
-        },
-    };
-    let material_handle = materials.add(material);
-
-    // Z-ordering: arrows on top of circles but below combo text
     // Z-ordering: reverse arrows (+0.0005 relative to object base)
     let z = -(index as f32 * 0.001) + 0.0005;
 
+    // Calculate rotation to match direction (which currently points toward the "tip")
+    // Our shader chevron points right (+X)
+    let angle = direction.y.atan2(direction.x);
+    
+    // Use cache for arrow material
+    let _opacity_bits = opacity.to_bits();
+    let material_handle = state.arrow_cache.entry(_opacity_bits).or_insert_with(|| {
+        materials.add(ArrowMaterial {
+            uniforms: ArrowUniforms {
+                color: Color::WHITE.into(),
+                thickness_rel: 0.2,
+                opacity,
+                _padding: Vec2::ZERO,
+            },
+        })
+    }).clone();
+
     commands.spawn((
-        Mesh2d(mesh_handle),
+        Mesh2d(state.unit_mesh.clone()),
         MeshMaterial2d(material_handle),
-        Transform::from_xyz(arrow_pos.x, arrow_pos.y, z),
+        Transform::from_xyz(arrow_pos.x, arrow_pos.y, z)
+            .with_rotation(Quat::from_rotation_z(angle))
+            .with_scale(Vec3::new(size * 3.0, size * 3.0, 1.0)), // Mesh size was size * 3.0
         ArrowMesh,
         ArrowEntity { object_index: index, position },
     ));
@@ -544,7 +490,7 @@ fn spawn_arrow(
 /// Spawn a spinner mesh entity
 fn spawn_spinner(
     commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
+    state: &mut SdfRenderState,
     materials: &mut ResMut<Assets<SpinnerMaterial>>,
     index: usize,
     obj: &RenderObject,
@@ -562,16 +508,9 @@ fn spawn_spinner(
     let progress = (elapsed / duration).min(1.0) as f32;
     let rotation = (current_time / 50.0).to_radians() as f32;
     
-    // Create mesh large enough for spinner
-    let mesh_size = max_radius * 2.5;
-    let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size));
-    let mesh_handle = meshes.add(mesh);
-    
     let material = SpinnerMaterial {
         uniforms: SpinnerUniforms {
             color: Color::WHITE.into(),
-            center,
-            max_radius,
             progress,
             rotation,
             opacity,
@@ -580,14 +519,14 @@ fn spawn_spinner(
     };
     let material_handle = materials.add(material);
     
-    // Z-ordering: spinner in front (user interacts with it)
     // Z-ordering: spinner (+0.0000 relative to object base)
     let z = -(index as f32 * 0.001);
     
     commands.spawn((
-        Mesh2d(mesh_handle),
+        Mesh2d(state.unit_mesh.clone()),
         MeshMaterial2d(material_handle),
-        Transform::from_xyz(center.x, center.y, z),
+        Transform::from_xyz(center.x, center.y, z)
+            .with_scale(Vec3::new(max_radius * 2.5, max_radius * 2.5, 1.0)),
         SpinnerMesh,
         SdfHitObject { object_index: index },
     ));
@@ -595,7 +534,7 @@ fn spawn_spinner(
 
 fn spawn_slider(
     commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
+    state: &mut SdfRenderState,
     materials: &mut ResMut<Assets<SliderMaterial>>,
     index: usize,
     obj: &RenderObject,
@@ -635,10 +574,6 @@ fn spawn_slider(
     let bbox_size = bbox_max - bbox_min;
     let bbox_center = (bbox_min + bbox_max) / 2.0;
 
-    // Create mesh covering the bounding box
-    let mesh = Mesh::from(Rectangle::new(bbox_size.x, bbox_size.y));
-    let mesh_handle = meshes.add(mesh);
-
     // Pack path data for shader
     let mut path_data = SliderPathData::default();
     let count = screen_points.len().min(128);
@@ -676,462 +611,313 @@ fn spawn_slider(
     };
     let material_handle = materials.add(material);
 
-    // Z-ordering: later objects should be behind (lower z)
     // Z-ordering: slider body (+0.0000 relative to object base)
     let z = -(index as f32 * 0.001);
 
     commands.spawn((
-        Mesh2d(mesh_handle),
+        Mesh2d(state.unit_mesh.clone()),
         MeshMaterial2d(material_handle),
-        Transform::from_xyz(bbox_center.x, bbox_center.y, z),
-        SdfHitObject { object_index: index },
+        Transform::from_xyz(bbox_center.x, bbox_center.y, z)
+            .with_scale(Vec3::new(bbox_size.x, bbox_size.y, 1.0)),
         SliderMesh,
-    ));
-}
-
-/// Spawn a slider head circle entity (for approach circle only)
-fn spawn_slider_head(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<CircleMaterial>>,
-    index: usize,
-    obj: &RenderObject,
-    radius: f32,
-    opacity: f32,
-    current_time: f64,
-    beatmap: &BeatmapView,
-    transform: &PlayfieldTransform,
-) {
-    let pos = transform.osu_to_screen(obj.x, obj.y);
-    
-    // Approach circle scale
-    let approach_scale = beatmap.approach_scale(obj, current_time);
-    
-    // Mesh size needs to cover approach circle at maximum scale
-    let max_radius = radius * approach_scale.max(4.0) + 10.0;
-    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
-    let mesh_handle = meshes.add(mesh);
-
-    // Get combo color
-    let (r, g, b) = beatmap.combo_color(obj);
-    
-    // Slider head: visible border circle + approach circle
-    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Transparent body
-    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
-    let approach_color = Color::srgba(r, g, b, 1.0);  // Combo color approach ring
-
-    let border_width = radius * 0.05;
-
-    let material = CircleMaterial {
-        uniforms: CircleUniforms {
-            body_color: body_color.into(),
-            border_color: border_color.into(),
-            approach_color: approach_color.into(),
-            radius,
-            border_width,
-            approach_scale,
-            approach_width: 2.5,  // Thin approach circle ring
-            opacity,
-            center: pos,
-        },
-    };
-    let material_handle = materials.add(material);
-
-    // Z-ordering: slider head should be slightly in front of slider body
-    // Z-ordering: slider head (+0.0007 relative to object base)
-    let z = -(index as f32 * 0.001) + 0.0007;
-
-    commands.spawn((
-        Mesh2d(mesh_handle),
-        MeshMaterial2d(material_handle),
-        Transform::from_xyz(pos.x, pos.y, z),
         SdfHitObject { object_index: index },
-        SliderHeadMesh,
     ));
 }
 
-/// Spawn a slider tail circle entity (end cap)
-fn spawn_slider_tail(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<CircleMaterial>>,
-    index: usize,
-    obj: &RenderObject,
-    path_points: &[(f32, f32)],
-    radius: f32,
-    opacity: f32,
-    beatmap: &BeatmapView,
-    transform: &PlayfieldTransform,
-) {
-    // Get tail position from last path point
-    let (tail_x, tail_y) = match path_points.last() {
-        Some(&pos) => pos,
-        None => return,
-    };
-    let pos = transform.osu_to_screen(tail_x, tail_y);
-    
-    // Mesh size for tail circle
-    let max_radius = radius + 10.0;
-    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
-    let mesh_handle = meshes.add(mesh);
-
-    // Get combo color
-    let (r, g, b) = beatmap.combo_color(obj);
-    
-    // Tail circle: visible border, transparent body, no approach circle
-    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Transparent body
-    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
-    let approach_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // No approach circle
-
-    let border_width = radius * 0.05;
-
-    let material = CircleMaterial {
-        uniforms: CircleUniforms {
-            body_color: body_color.into(),
-            border_color: border_color.into(),
-            approach_color: approach_color.into(),
-            radius,
-            border_width,
-            approach_scale: 1.0,  // No approach circle
-            approach_width: 0.0,
-            opacity,
-            center: pos,
-        },
-    };
-    let material_handle = materials.add(material);
-
-    // Z-ordering: tail slightly behind head
-    // Z-ordering: slider tail (+0.0003 relative to object base)
-    let z = -(index as f32 * 0.001) + 0.0003;
-
-    commands.spawn((
-        Mesh2d(mesh_handle),
-        MeshMaterial2d(material_handle),
-        Transform::from_xyz(pos.x, pos.y, z),
-        SdfHitObject { object_index: index },
-        SliderTailMesh,
-    ));
-}
-
-/// Spawn a slider ball circle entity
-fn spawn_slider_ball(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<CircleMaterial>>,
-    index: usize,
-    obj: &RenderObject,
-    radius: f32,
-    opacity: f32,
-    current_time: f64,
-    beatmap: &BeatmapView,
-    transform: &PlayfieldTransform,
-) {
-    // Get ball position (or head position if not active yet)
-    let (ball_x, ball_y) = beatmap.slider_ball_position(obj, current_time)
-        .unwrap_or((obj.x, obj.y));
-    let pos = transform.osu_to_screen(ball_x, ball_y);
-    
-    // Ball is smaller than the circle
-    let ball_radius = radius * 0.6;
-    let max_radius = ball_radius + 10.0;
-    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
-    let mesh_handle = meshes.add(mesh);
-
-    // Get combo color
-    let (r, g, b) = beatmap.combo_color(obj);
-    
-    // Ball: solid colored circle
-    let body_color = Color::srgba(r * 0.3, g * 0.3, b * 0.3, 0.8);  // Darker fill
-    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
-    let approach_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // No approach
-
-    let border_width = ball_radius * 0.1;
-
-    // Ball is only visible during active slider
-    let ball_visible = beatmap.slider_ball_position(obj, current_time).is_some();
-    let ball_opacity = if ball_visible { opacity } else { 0.0 };
-
-    let material = CircleMaterial {
-        uniforms: CircleUniforms {
-            body_color: body_color.into(),
-            border_color: border_color.into(),
-            approach_color: approach_color.into(),
-            radius: ball_radius,
-            border_width,
-            approach_scale: 1.0,
-            approach_width: 0.0,
-            opacity: ball_opacity,
-            center: pos,
-        },
-    };
-    let material_handle = materials.add(material);
-
-    // Z-ordering: ball on top
-    // Z-ordering: slider ball (+0.0007 relative to object base)
-    let z = -(index as f32 * 0.001) + 0.0007;
-
-    commands.spawn((
-        Mesh2d(mesh_handle),
-        MeshMaterial2d(material_handle),
-        Transform::from_xyz(pos.x, pos.y, z),
-        SdfHitObject { object_index: index },
-        SliderBallMesh,
-    ));
-}
-
-/// Spawn a circle mesh entity
-fn spawn_circle(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<CircleMaterial>>,
-    index: usize,
-    obj: &RenderObject,
-    radius: f32,
-    opacity: f32,
-    current_time: f64,
-    beatmap: &BeatmapView,
-    transform: &PlayfieldTransform,
-) {
-    let pos = transform.osu_to_screen(obj.x, obj.y);
-    
-    // Approach circle scale
-    let approach_scale = beatmap.approach_scale(obj, current_time);
-    
-    // Mesh size needs to cover approach circle at maximum scale
-    let max_radius = radius * approach_scale.max(4.0) + 10.0;
-    let mesh = Mesh::from(Rectangle::new(max_radius * 2.0, max_radius * 2.0));
-    let mesh_handle = meshes.add(mesh);
-
-    // Get combo color for this object
-    let (r, g, b) = beatmap.combo_color(obj);
-    
-    // Create material - fully transparent body, combo-colored border
-    let body_color = Color::srgba(0.0, 0.0, 0.0, 0.0);  // Fully transparent
-    let border_color = Color::srgba(r, g, b, 1.0);  // Combo color border
-    let approach_color = Color::srgba(r, g, b, 1.0);  // Combo color approach ring
-
-    // Border width - match what slider uses
-    let border_width = radius * 0.05;
-
-    let material = CircleMaterial {
-        uniforms: CircleUniforms {
-            body_color: body_color.into(),
-            border_color: border_color.into(),
-            approach_color: approach_color.into(),
-            radius,
-            border_width,
-            approach_scale,
-            approach_width: 2.5,  // Thin approach circle ring
-            opacity,
-            center: pos,
-        },
-    };
-    let material_handle = materials.add(material);
-
-
-    // Z-ordering: later objects should be behind (lower z)
-    // Z-ordering: circle (+0.0007 relative to object base)
-    let z = -(index as f32 * 0.001) + 0.0007;
-
-    commands.spawn((
-        Mesh2d(mesh_handle),
-        MeshMaterial2d(material_handle),
-        Transform::from_xyz(pos.x, pos.y, z),
-        SdfHitObject { object_index: index },
-        CircleMesh,
-    ));
-}
-
-/// Update materials for existing SDF objects (opacity, approach scale, etc.)
-fn update_sdf_materials(
+/// Update the circle batch mesh from current entity data
+fn update_circle_batches(
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
     transform: Res<PlayfieldTransform>,
-    mut circle_materials: ResMut<Assets<CircleMaterial>>,
-    mut slider_materials: ResMut<Assets<SliderMaterial>>,
-    mut spinner_materials: ResMut<Assets<SpinnerMaterial>>,
-    mut arrow_materials: ResMut<Assets<ArrowMaterial>>,
-    circle_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<CircleMesh>>,
-    slider_head_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderHeadMesh>>,
-    slider_tail_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>), With<SliderTailMesh>>,
-    mut slider_ball_query: Query<(&SdfHitObject, &MeshMaterial2d<CircleMaterial>, &mut Transform), With<SliderBallMesh>>,
-    slider_query: Query<(&SdfHitObject, &MeshMaterial2d<SliderMaterial>), With<SliderMesh>>,
-    spinner_query: Query<(&SdfHitObject, &MeshMaterial2d<SpinnerMaterial>), With<SpinnerMesh>>,
-    arrow_query: Query<(&ArrowEntity, &MeshMaterial2d<ArrowMaterial>)>,
-    mut msdf_materials: ResMut<Assets<MsdfMaterial>>,
-    digit_query: Query<(&SdfDigit, &MeshMaterial2d<MsdfMaterial>)>,
+    mut state: ResMut<SdfRenderState>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let current_time = playback.current_time;
-    let visible = beatmap.visible_objects(current_time);
-    
-    // Build a map of visible objects for quick lookup
-    let visible_map: std::collections::HashMap<usize, f32> = visible
-        .iter()
-        .map(|(idx, _obj, opacity)| (*idx, *opacity))
-        .collect();
+    if transform.scale <= 0.0 {
+        return;
+    }
 
-    // Update circle materials
-    for (hit_obj, material_handle) in circle_query.iter() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
+    if let Some(mesh) = meshes.get_mut(&state.circle_batch_mesh) {
+        let current_time = playback.current_time;
+        let visible = beatmap.visible_objects(current_time);
+        
+        let count_estimate = visible.len() * 4; // Max 4 circles per object (slider)
+        let mut positions = Vec::with_capacity(count_estimate * 4);
+        let mut uvs = Vec::with_capacity(count_estimate * 4);
+        let mut indices = Vec::with_capacity(count_estimate * 6);
+        let mut body_colors = Vec::with_capacity(count_estimate * 4);
+        let mut border_colors = Vec::with_capacity(count_estimate * 4);
+        let mut approach_colors = Vec::with_capacity(count_estimate * 4);
+        let mut params = Vec::with_capacity(count_estimate * 4);
+
+        let mut quad_count = 0usize;
+        let radius = transform.scale_radius(beatmap.circle_radius);
+        
+        // Expansion factor for border and approach circles
+        let expansion = 1.4f32;
+
+        // visible is already sorted by time (which approximates Z in world coords)
+        // We iterate and build quads. Since we are building a single mesh,
+        // we use Z in the transform or just the hit_obj.object_index for ordering.
+        for (index, obj, opacity_val) in visible.iter() {
+            let opacity = *opacity_val;
+            if opacity < 0.01 { continue; }
+
+            let (r, g, b) = beatmap.combo_color(obj);
+            let combo_color = LinearRgba::new(r, g, b, 1.0);
+            let body_color = LinearRgba::new(r, g, b, 0.3 * opacity);
+            let border_color = LinearRgba::new(1.0, 1.0, 1.0, 1.0);
+            let white_color = LinearRgba::new(1.0, 1.0, 1.0, 1.0).to_f32_array();
+            let approach_color = combo_color.to_f32_array();
+
+            // Helper to push a quad
+            let mut push_quad = |center: Vec2, current_radius: f32, z: f32, b_col: [f32; 4], br_col: [f32; 4], a_col: [f32; 4], p: [f32; 4]| {
+                let base_idx = (quad_count * 4) as u32;
                 
-                // Update approach scale
-                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
-                    material.uniforms.approach_scale = beatmap.approach_scale(obj, current_time);
-                }
-            }
-        }
-    }
-
-    // Update slider head circle materials (for approach circles)
-    for (hit_obj, material_handle) in slider_head_query.iter() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
+                let approach_scale = p[2];
+                let max_scale = approach_scale.max(1.0);
+                let s = current_radius * expansion * max_scale;
                 
-                // Update approach scale for slider head
-                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
-                    material.uniforms.approach_scale = beatmap.approach_scale(obj, current_time);
+                positions.push(Vec3::new(center.x - s, center.y - s, z));
+                positions.push(Vec3::new(center.x + s, center.y - s, z));
+                positions.push(Vec3::new(center.x + s, center.y + s, z));
+                positions.push(Vec3::new(center.x - s, center.y + s, z));
+
+                uvs.push(Vec2::new(0.0, 1.0));
+                uvs.push(Vec2::new(1.0, 1.0));
+                uvs.push(Vec2::new(1.0, 0.0));
+                uvs.push(Vec2::new(0.0, 0.0));
+
+                indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+
+                for _ in 0..4 {
+                    body_colors.push(b_col);
+                    border_colors.push(br_col);
+                    approach_colors.push(a_col);
+                    params.push(p);
                 }
-            }
-        }
-    }
+                quad_count += 1;
+            };
 
-    // Update slider tail circle materials
-    for (hit_obj, material_handle) in slider_tail_query.iter() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
-            }
-        }
-    }
+            let z_base = -(*index as f32 * 0.001);
 
-    // Update slider ball materials AND transform position
-    for (hit_obj, material_handle, mut ball_transform) in slider_ball_query.iter_mut() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = circle_materials.get_mut(material_handle.id()) {
-                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
-                    // Hide ball completely before slider starts
-                    if current_time < obj.start_time {
-                        material.uniforms.opacity = 0.0;
-                        continue;
+            match &obj.kind {
+                RenderObjectKind::Circle => {
+                    let screen_pos = transform.osu_to_screen(obj.x, obj.y);
+                    let approach_scale = beatmap.approach_scale(obj, current_time);
+                    
+                    push_quad(
+                        screen_pos,
+                        radius,
+                        z_base,
+                        body_color.to_f32_array(),
+                        white_color,
+                        approach_color,
+                        [0.05, 2.5 / radius, approach_scale, opacity]
+                    );
+                }
+                RenderObjectKind::Slider { path_points, .. } => {
+                    // Slider Head
+                    let head_pos = transform.osu_to_screen(obj.x, obj.y);
+                    let approach_scale = beatmap.approach_scale(obj, current_time);
+                    push_quad(
+                        head_pos,
+                        radius,
+                        z_base + 0.0001,
+                        body_color.to_f32_array(),
+                        white_color,
+                        approach_color,
+                        [0.1, 2.5 / radius, approach_scale, opacity]
+                    );
+
+                    // Slider Tail
+                    if let Some(tail) = path_points.last() {
+                        let tail_pos = transform.osu_to_screen(tail.0, tail.1);
+                        push_quad(
+                            tail_pos,
+                            radius, 
+                            z_base + 0.0001,
+                            body_color.to_f32_array(),
+                            white_color,
+                            approach_color,
+                            [0.1, 0.0, 1.0, opacity]
+                        );
                     }
 
-                    // Clamp time to active duration for position calculation
-                    // This ensures the ball stays at the end during fade-out
-                    let active_time = current_time.clamp(obj.start_time, obj.end_time);
-
-                    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, active_time) {
-                        let pos = transform.osu_to_screen(ball_x, ball_y);
-                        material.uniforms.center = pos;
-                        material.uniforms.opacity = opacity;
-                        // Move the mesh quad to follow the ball
-                        ball_transform.translation.x = pos.x;
-                        ball_transform.translation.y = pos.y;
-                    } else {
-                        // Position failed (should not happen with clamped time)
-                        material.uniforms.opacity = 0.0;
+                    // Slider Ball
+                    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, current_time) {
+                        let ball_screen = transform.osu_to_screen(ball_x, ball_y);
+                        // Ball should NOT have an approach circle, so p[2] = 1.0
+                        push_quad(
+                            ball_screen,
+                            radius,
+                            z_base + 0.0002,
+                            body_color.to_f32_array(),
+                            white_color,
+                            approach_color,
+                            [0.1, 0.0, 1.0, opacity]
+                        );
                     }
                 }
+                _ => {}
             }
         }
-    }
 
-    // Update slider materials
-    for (hit_obj, material_handle) in slider_query.iter() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = slider_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
-            }
+        if quad_count == 0 {
+            // Nothing to render, but we must update state to avoid allocator churn
+            // If we don't, the previous frame's geometry might remain.
         }
-    }
 
-    // Update spinner materials (rotation and progress are dynamic)
-    for (hit_obj, material_handle) in spinner_query.iter() {
-        if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
-            if let Some(material) = spinner_materials.get_mut(material_handle.id()) {
-                if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
-                    if let RenderObjectKind::Spinner { duration } = &obj.kind {
-                        let elapsed = (current_time - obj.start_time).max(0.0);
-                        let progress = (elapsed / duration).min(1.0) as f32;
-                        let rotation = (current_time / 50.0).to_radians() as f32;
-                        
-                        material.uniforms.progress = progress;
-                        material.uniforms.rotation = rotation;
-                        material.uniforms.opacity = opacity;
-                    }
-                }
-            }
+        // Buffer stabilization: pad capacity to next power of two
+        let required_capacity = quad_count.next_power_of_two().max(128);
+        if required_capacity > state.circle_capacity {
+            state.circle_capacity = required_capacity;
         }
-    }
+        
+        let capacity = state.circle_capacity;
+        // Fill remaining capacity with degenerate triangles at origin
+        let dummy_col = [0.0; 4];
+        let dummy_params = [0.0; 4];
 
-    // Update combo digit materials (MSDF)
-    for (digit, material_handle) in digit_query.iter() {
-        if let Some(&opacity) = visible_map.get(&digit.object_index) {
-            if let Some(material) = msdf_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
+        for _ in quad_count..capacity {
+            for _ in 0..4 {
+                positions.push(Vec3::ZERO);
+                uvs.push(Vec2::ZERO);
+                body_colors.push(dummy_col);
+                border_colors.push(dummy_col);
+                approach_colors.push(dummy_col);
+                params.push(dummy_params);
             }
+            indices.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         }
-    }
 
-    // Update arrow materials
-    for (arrow, material_handle) in arrow_query.iter() {
-        if let Some(&opacity) = visible_map.get(&arrow.object_index) {
-            if let Some(material) = arrow_materials.get_mut(material_handle.id()) {
-                material.uniforms.opacity = opacity;
-            }
-        }
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(ATTRIBUTE_BODY_COLOR, body_colors);
+        mesh.insert_attribute(ATTRIBUTE_BORDER_COLOR, border_colors);
+        mesh.insert_attribute(ATTRIBUTE_APPROACH_COLOR, approach_colors);
+        mesh.insert_attribute(ATTRIBUTE_SDF_PARAMS, params);
+        mesh.insert_indices(Indices::U32(indices));
     }
 }
 
-/// Despawn objects that are no longer visible
-fn despawn_invisible_objects(
-    mut commands: Commands,
+/// Update the MSDF batch mesh from current entity data
+fn update_msdf_batches(
     beatmap: Res<BeatmapView>,
     playback: Res<PlaybackStateRes>,
+    transform: Res<PlayfieldTransform>,
+    atlas: Res<MsdfAtlas>,
     mut state: ResMut<SdfRenderState>,
-    query: Query<(Entity, &SdfHitObject)>,
-    digit_query: Query<(Entity, &SdfDigit)>,
-    arrow_query: Query<(Entity, &ArrowEntity)>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let current_time = playback.current_time;
-    let visible = beatmap.visible_objects(current_time);
-    let visible_indices: std::collections::HashSet<usize> = visible
-        .iter()
-        .map(|(idx, _, _)| *idx)
-        .collect();
+    if transform.scale <= 0.0 {
+        return;
+    }
 
-    for (entity, hit_obj) in query.iter() {
-        if !visible_indices.contains(&hit_obj.object_index) {
-            commands.entity(entity).despawn();
+    if let Some(mesh) = meshes.get_mut(&state.msdf_batch_mesh) {
+        let current_time = playback.current_time;
+        let visible = beatmap.visible_objects(current_time);
+        let radius = transform.scale_radius(beatmap.circle_radius);
+        let digit_size = radius * 0.5;
+
+        let mut quad_count = 0usize;
+        let mut positions = Vec::new();
+        let mut uvs = Vec::new();
+        let mut indices = Vec::new();
+        let mut colors = Vec::new();
+        let mut uv_bounds = Vec::new();
+        let mut params = Vec::new();
+
+        for (index, obj, opacity) in visible.iter() {
+            let opacity = *opacity;
+            if opacity < 0.01 { continue; }
             
-            // Remove from state tracking
-            state.spawned_sliders.retain(|&i| i != hit_obj.object_index);
-            state.spawned_slider_heads.retain(|&i| i != hit_obj.object_index);
-            state.spawned_slider_tails.retain(|&i| i != hit_obj.object_index);
-            state.spawned_slider_balls.retain(|&i| i != hit_obj.object_index);
-            state.spawned_circles.retain(|&i| i != hit_obj.object_index);
-            state.spawned_spinners.retain(|&i| i != hit_obj.object_index);
-        }
-    }
+            // Only circles and sliders have combo numbers
+            match &obj.kind {
+                RenderObjectKind::Circle | RenderObjectKind::Slider { .. } => {
+                    let pos = transform.osu_to_screen(obj.x, obj.y);
+                    let combo_str = obj.combo_number.to_string();
+                    
+                    // Calculate total width
+                    let mut total_width = 0.0;
+                    for ch in combo_str.chars() {
+                        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
+                        let advance = atlas.digit_advances.get(digit_value).copied().unwrap_or(0.5);
+                        total_width += advance * digit_size;
+                    }
 
-    // Despawn SDF digits separately
-    for (entity, digit) in digit_query.iter() {
-        if !visible_indices.contains(&digit.object_index) {
-            commands.entity(entity).despawn();
-            state.spawned_combo_texts.retain(|&i| i != digit.object_index);
-        }
-    }
+                    let mut current_x = pos.x - total_width * 0.5;
+                    let z = -(*index as f32 * 0.001) + 0.0009;
 
-    // Despawn arrows separately
-    for (entity, arrow) in arrow_query.iter() {
-        if !visible_indices.contains(&arrow.object_index) {
-            commands.entity(entity).despawn();
-            match arrow.position {
-                ArrowPosition::End => state.spawned_end_arrows.retain(|&i| i != arrow.object_index),
-                ArrowPosition::Start => state.spawned_start_arrows.retain(|&i| i != arrow.object_index),
+                    for ch in combo_str.chars() {
+                        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
+                        let size_ratio = atlas.digit_sizes.get(digit_value).copied().unwrap_or(Vec2::ONE);
+                        let glyph_width = digit_size * size_ratio.x;
+                        let glyph_height = digit_size * 1.2;
+                        
+                        let digit_center_x = current_x + (atlas.digit_advances[digit_value] * digit_size) * 0.5;
+                        
+                        // Push Quad
+                        let base_idx = (quad_count * 4) as u32;
+                        let w2 = glyph_width * 0.5;
+                        let h2 = glyph_height * 0.5;
+
+                        positions.push(Vec3::new(digit_center_x - w2, pos.y - h2, z));
+                        positions.push(Vec3::new(digit_center_x + w2, pos.y - h2, z));
+                        positions.push(Vec3::new(digit_center_x + w2, pos.y + h2, z));
+                        positions.push(Vec3::new(digit_center_x - w2, pos.y + h2, z));
+
+                        uvs.push(Vec2::new(0.0, 1.0));
+                        uvs.push(Vec2::new(1.0, 1.0));
+                        uvs.push(Vec2::new(1.0, 0.0));
+                        uvs.push(Vec2::new(0.0, 0.0));
+
+                        indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
+
+                        let col = [1.0, 1.0, 1.0, 1.0];
+                        let b = atlas.digit_uvs[digit_value].to_array();
+                        let p = [opacity, atlas.px_range];
+
+                        for _ in 0..4 {
+                            colors.push(col);
+                            uv_bounds.push(b);
+                            params.push(p);
+                        }
+
+                        current_x += atlas.digit_advances[digit_value] * digit_size;
+                        quad_count += 1;
+                    }
+                }
+                _ => {}
             }
         }
+
+        // Buffer stabilization
+        let required_capacity = quad_count.next_power_of_two().max(64);
+        if required_capacity > state.msdf_capacity {
+            state.msdf_capacity = required_capacity;
+        }
+
+        let capacity = state.msdf_capacity;
+        let dummy_col = [0.0; 4];
+        let dummy_uv_b = [0.0; 4];
+        let dummy_p = [0.0; 2];
+
+        for _ in quad_count..capacity {
+            for _ in 0..4 {
+                positions.push(Vec3::ZERO);
+                uvs.push(Vec2::ZERO);
+                colors.push(dummy_col);
+                uv_bounds.push(dummy_uv_b);
+                params.push(dummy_p);
+            }
+            indices.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        }
+
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+        mesh.insert_attribute(ATTRIBUTE_MSDF_UV_BOUNDS, uv_bounds);
+        mesh.insert_attribute(ATTRIBUTE_MSDF_PARAMS, params);
+        mesh.insert_indices(Indices::U32(indices));
     }
 }

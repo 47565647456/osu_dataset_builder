@@ -1,11 +1,105 @@
-//! Custom Material2d implementations for SDF-based hit object rendering
+use bevy::prelude::*;
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::{MeshVertexAttribute, MeshVertexBufferLayoutRef};
+use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError, VertexFormat};
+use bevy::shader::ShaderRef;
+use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 
-use bevy::{
-    prelude::*,
-    render::render_resource::{AsBindGroup, ShaderType},
-    shader::ShaderRef,
-    sprite_render::{Material2d, Material2dPlugin, AlphaMode2d},
-};
+/// Custom vertex attributes for SDF batch rendering
+pub const ATTRIBUTE_BODY_COLOR: MeshVertexAttribute =
+    MeshVertexAttribute::new("BodyColor", 20001, VertexFormat::Float32x4);
+pub const ATTRIBUTE_BORDER_COLOR: MeshVertexAttribute =
+    MeshVertexAttribute::new("BorderColor", 20002, VertexFormat::Float32x4);
+pub const ATTRIBUTE_APPROACH_COLOR: MeshVertexAttribute =
+    MeshVertexAttribute::new("ApproachColor", 20003, VertexFormat::Float32x4);
+/// Packed params: (border_width_rel, approach_width_rel, approach_scale, opacity)
+pub const ATTRIBUTE_SDF_PARAMS: MeshVertexAttribute =
+    MeshVertexAttribute::new("SdfParams", 20004, VertexFormat::Float32x4);
+
+pub const ATTRIBUTE_MSDF_UV_BOUNDS: MeshVertexAttribute =
+    MeshVertexAttribute::new("MsdfUvBounds", 20005, VertexFormat::Float32x4);
+pub const ATTRIBUTE_MSDF_PARAMS: MeshVertexAttribute =
+    MeshVertexAttribute::new("MsdfParams", 20006, VertexFormat::Float32x2);
+
+
+
+/// Dummy uniforms for batch materials to satisfy shader bindings
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+pub struct BatchUniforms {
+    pub _dummy: Vec4,
+}
+
+/// Material for rendering batched hit circles with SDF
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug, Default)]
+pub struct CircleBatchMaterial {
+    #[uniform(0)]
+    pub uniforms: BatchUniforms,
+}
+
+impl Material2d for CircleBatchMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/circle_batch.wgsl".into()
+    }
+    fn fragment_shader() -> ShaderRef {
+        "shaders/circle_batch.wgsl".into()
+    }
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
+    fn specialize(
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: Material2dKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let vertex_attributes = vec![
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_UV_0.at_shader_location(1),
+            ATTRIBUTE_BODY_COLOR.at_shader_location(2),
+            ATTRIBUTE_BORDER_COLOR.at_shader_location(3),
+            ATTRIBUTE_APPROACH_COLOR.at_shader_location(4),
+            ATTRIBUTE_SDF_PARAMS.at_shader_location(5),
+        ];
+        descriptor.vertex.buffers[0] = layout.0.get_layout(&vertex_attributes)?;
+        Ok(())
+    }
+}
+
+/// Material for rendering batched MSDF digits
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct MsdfBatchMaterial {
+    #[uniform(0)]
+    pub uniforms: BatchUniforms,
+    #[texture(1)]
+    #[sampler(2)]
+    pub texture: Handle<Image>,
+}
+
+impl Material2d for MsdfBatchMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/msdf_batch.wgsl".into()
+    }
+    fn fragment_shader() -> ShaderRef {
+        "shaders/msdf_batch.wgsl".into()
+    }
+    fn alpha_mode(&self) -> AlphaMode2d {
+        AlphaMode2d::Blend
+    }
+    fn specialize(
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: Material2dKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let vertex_attributes = vec![
+            Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+            Mesh::ATTRIBUTE_UV_0.at_shader_location(1),
+            Mesh::ATTRIBUTE_COLOR.at_shader_location(2),
+            ATTRIBUTE_MSDF_UV_BOUNDS.at_shader_location(3),
+            ATTRIBUTE_MSDF_PARAMS.at_shader_location(4),
+        ];
+        descriptor.vertex.buffers[0] = layout.0.get_layout(&vertex_attributes)?;
+        Ok(())
+    }
+}
 
 /// Material for rendering slider bodies with SDF
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
@@ -66,12 +160,11 @@ pub struct CircleUniforms {
     pub body_color: LinearRgba,
     pub border_color: LinearRgba,
     pub approach_color: LinearRgba,
-    pub radius: f32,
-    pub border_width: f32,
+    pub border_width_rel: f32, // Width relative to radius 1.0
+    pub approach_width_rel: f32,
     pub approach_scale: f32,
-    pub approach_width: f32,
     pub opacity: f32,
-    pub center: Vec2,
+    pub _padding: Vec2,
 }
 
 impl Material2d for CircleMaterial {
@@ -95,10 +188,7 @@ pub struct ArrowMaterial {
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
 pub struct ArrowUniforms {
     pub color: LinearRgba,
-    pub center: Vec2,
-    pub size: f32,
-    pub direction: Vec2,  // Normalized direction vector
-    pub thickness: f32,
+    pub thickness_rel: f32,
     pub opacity: f32,
     pub _padding: Vec2,  // For alignment
 }
@@ -124,8 +214,6 @@ pub struct SpinnerMaterial {
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
 pub struct SpinnerUniforms {
     pub color: LinearRgba,
-    pub center: Vec2,
-    pub max_radius: f32,
     pub progress: f32,    // 0.0 to 1.0
     pub rotation: f32,    // Rotation angle in radians
     pub opacity: f32,
@@ -207,6 +295,8 @@ impl Plugin for SdfMaterialsPlugin {
             .add_plugins(Material2dPlugin::<ArrowMaterial>::default())
             .add_plugins(Material2dPlugin::<SpinnerMaterial>::default())
             .add_plugins(Material2dPlugin::<MsdfMaterial>::default())
-            .add_plugins(Material2dPlugin::<GridMaterial>::default());
+            .add_plugins(Material2dPlugin::<GridMaterial>::default())
+            .add_plugins(Material2dPlugin::<CircleBatchMaterial>::default())
+            .add_plugins(Material2dPlugin::<MsdfBatchMaterial>::default());
     }
 }
