@@ -87,7 +87,7 @@ impl PlaybackStateRes {
 
     /// Set playback speed
     pub fn set_speed(&mut self, speed: f64) {
-        self.speed = speed.clamp(0.25, 4.0);
+        self.speed = speed.clamp(-4.0, 4.0);
     }
 
     /// Cycle through common speed values
@@ -114,6 +114,12 @@ impl PlaybackStateRes {
         };
     }
 
+    /// Toggle positive/negative playback speed
+    pub fn toggle_reverse(&mut self) {
+        self.speed = -self.speed;
+        self.last_update = Instant::now();
+    }
+
     /// Get formatted time string (MM:SS.ms)
     pub fn format_time(time_ms: f64) -> String {
         let total_secs = (time_ms / 1000.0).max(0.0);
@@ -136,10 +142,12 @@ impl PlaybackStateRes {
         if self.state == PlaybackState::Playing {
             let now = Instant::now();
             let delta = now.duration_since(self.last_update).as_secs_f64() * 1000.0 * self.speed;
-            self.current_time = (self.current_time + delta).min(self.total_duration);
+            self.current_time = (self.current_time + delta).clamp(0.0, self.total_duration);
             self.last_update = now;
 
-            if self.current_time >= self.total_duration {
+            if self.speed > 0.0 && self.current_time >= self.total_duration {
+                self.state = PlaybackState::Paused;
+            } else if self.speed < 0.0 && self.current_time <= 0.0 {
                 self.state = PlaybackState::Paused;
             }
         } else {

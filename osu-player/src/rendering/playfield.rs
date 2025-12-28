@@ -13,8 +13,11 @@ impl Plugin for PlayfieldPlugin {
             .init_resource::<ZoomLevel>()
             .add_systems(Startup, setup_camera)
             .add_systems(Startup, setup_playfield)
-            .add_systems(Update, handle_zoom_input)
-            .add_systems(Update, update_playfield_transform.after(handle_zoom_input));
+            .add_systems(Update, (
+                handle_zoom_input,
+                handle_pan_reset_input,
+                update_playfield_transform,
+            ).chain());
     }
 }
 
@@ -37,6 +40,8 @@ pub struct PlayfieldTransform {
     pub scale: f32,
     /// Offset to center playfield
     pub offset: Vec2,
+    /// Manual panning offset controlled by user
+    pub user_offset: Vec2,
     /// Playfield size in screen coordinates
     pub size: Vec2,
     /// Generation counter - incremented when transform changes
@@ -46,9 +51,10 @@ pub struct PlayfieldTransform {
 impl PlayfieldTransform {
     /// Convert osu! coordinates to screen coordinates
     pub fn osu_to_screen(&self, x: f32, y: f32) -> Vec2 {
+        let final_offset = self.offset + self.user_offset;
         Vec2::new(
-            self.offset.x + x * self.scale - PLAYFIELD_WIDTH * self.scale / 2.0,
-            self.offset.y - y * self.scale + PLAYFIELD_HEIGHT * self.scale / 2.0, // Flip Y
+            final_offset.x + x * self.scale - PLAYFIELD_WIDTH * self.scale / 2.0,
+            final_offset.y - y * self.scale + PLAYFIELD_HEIGHT * self.scale / 2.0, // Flip Y
         )
     }
 
@@ -141,6 +147,54 @@ fn handle_zoom_input(
     }
 }
 
+/// Handle mouse dragging for panning and F key for reset
+fn handle_pan_reset_input(
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion: MessageReader<bevy::input::mouse::MouseMotion>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut zoom: ResMut<ZoomLevel>,
+    mut transform: ResMut<PlayfieldTransform>,
+    ui_interaction_query: Query<&Interaction, With<Node>>,
+    mut is_dragging: Local<bool>,
+) {
+    // Reset with F key
+    if keyboard.just_pressed(KeyCode::KeyF) {
+        zoom.level = 1.0;
+        transform.user_offset = Vec2::ZERO;
+        transform.generation = transform.generation.wrapping_add(1);
+    }
+
+    // Check for drag start
+    if mouse_button.just_pressed(MouseButton::Left) {
+        // Only start dragging if not clicking on any UI elements
+        let is_over_ui = ui_interaction_query.iter().any(|i| *i != Interaction::None);
+        if !is_over_ui {
+            *is_dragging = true;
+        }
+    }
+
+    if mouse_button.just_released(MouseButton::Left) {
+        *is_dragging = false;
+    }
+
+    // Panning with left mouse button (only if drag started in valid area)
+    if *is_dragging && mouse_button.pressed(MouseButton::Left) {
+        let mut delta = Vec2::ZERO;
+        for event in mouse_motion.read() {
+            delta += event.delta;
+        }
+        
+        if delta != Vec2::ZERO {
+            transform.user_offset.x += delta.x;
+            transform.user_offset.y -= delta.y; // Screen Y is inverted relative to our world Y
+            transform.generation = transform.generation.wrapping_add(1);
+        }
+    } else {
+        // Drain mouse motion even if not dragging
+        mouse_motion.clear();
+    }
+}
+
 /// Update playfield transform based on window size and zoom
 fn update_playfield_transform(
     windows: Query<&Window>,
@@ -165,28 +219,32 @@ fn update_playfield_transform(
         let scale = base_scale * zoom.level;
 
         // Check if transform changed
-        let new_offset = Vec2::new(0.0, ui_height / 2.0);
-        if (transform.scale - scale).abs() > 0.001 || (transform.offset - new_offset).length() > 0.001 {
+        let base_offset = Vec2::new(0.0, ui_height / 2.0);
+        let final_offset = base_offset + transform.user_offset;
+
+        if (transform.scale - scale).abs() > 0.001 || (transform.offset - base_offset).length() > 0.001 {
             transform.generation = transform.generation.wrapping_add(1);
         }
 
         transform.scale = scale;
         transform.size = Vec2::new(PLAYFIELD_WIDTH * scale, PLAYFIELD_HEIGHT * scale);
         
-        // Center playfield, offset up to make room for UI
-        transform.offset = new_offset;
+        // Base alignment offset
+        transform.offset = base_offset;
 
         // Update background sprite
         for mut tf in playfield_query.iter_mut() {
             tf.scale = Vec3::splat(scale);
-            tf.translation.y = ui_height / 2.0;
+            tf.translation.x = transform.user_offset.x;
+            tf.translation.y = final_offset.y;
         }
 
         // Update border
         for mut tf in border_query.iter_mut() {
             if tf.translation.z < -10.0 {
                 tf.scale = Vec3::splat(scale);
-                tf.translation.y = ui_height / 2.0;
+                tf.translation.x = transform.user_offset.x;
+                tf.translation.y = final_offset.y;
             }
         }
     }

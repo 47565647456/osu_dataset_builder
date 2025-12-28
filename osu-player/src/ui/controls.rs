@@ -50,6 +50,14 @@ pub struct ZoomPlusButton;
 #[derive(Component)]
 pub struct ZoomDisplayText;
 
+/// Marker for reset view button
+#[derive(Component)]
+pub struct ResetViewButton;
+
+/// Marker for reverse playback button
+#[derive(Component)]
+pub struct ReverseButton;
+
 fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Res<UiFont>) {
     let font = ui_font.0.clone();
 
@@ -68,6 +76,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
                 ..default()
             },
             BackgroundColor(Color::srgb(0.06, 0.06, 0.08)),
+            Interaction::default(),
         ))
         .with_children(|parent| {
             // Play/Pause button
@@ -128,6 +137,29 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
                 .with_children(|btn| {
                     btn.spawn((
                         Text::new("1.00x"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
+            // Reverse button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    ReverseButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Reverse"),
                         TextFont {
                             font: font.clone(),
                             font_size: 14.0,
@@ -238,6 +270,29 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
                     ));
                 });
 
+            // Focus (Reset) button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.25, 0.25, 0.3)),
+                    ResetViewButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Focus"),
+                        TextFont {
+                            font: font.clone(),
+                            font_size: 14.0,
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
             // Spacer
             parent.spawn(Node {
                 flex_grow: 1.0,
@@ -246,7 +301,7 @@ fn setup_controls(mut commands: Commands, beatmap: Res<BeatmapView>, ui_font: Re
 
             // Controls help
             parent.spawn((
-                Text::new("Space: Play/Pause | ←/→: Seek | ↑/↓: Speed"),
+                Text::new("Space: Play/Pause | R: Reverse | ←/→: Seek | ↑/↓: Speed | L-Drag: Pan | Wheel: Zoom | F: Focus"),
                 TextFont {
                     font: font.clone(),
                     font_size: 12.0,
@@ -306,10 +361,17 @@ fn handle_button_clicks(
     mouse: Res<ButtonInput<MouseButton>>,
     play_query: Query<&Interaction, (Changed<Interaction>, With<PlayPauseButton>)>,
     speed_query: Query<&Interaction, With<SpeedButton>>,
+    reverse_query: Query<&Interaction, (Changed<Interaction>, With<ReverseButton>)>,
 ) {
     for interaction in play_query.iter() {
         if *interaction == Interaction::Pressed {
             playback.toggle_play();
+        }
+    }
+
+    for interaction in reverse_query.iter() {
+        if *interaction == Interaction::Pressed {
+            playback.toggle_reverse();
         }
     }
 

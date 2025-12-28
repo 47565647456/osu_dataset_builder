@@ -50,4 +50,9 @@ fn handle_keyboard_input(
         let total = playback.total_duration;
         playback.seek(total - 1000.0);
     }
+
+    // R: toggle reverse
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        playback.toggle_reverse();
+    }
 }

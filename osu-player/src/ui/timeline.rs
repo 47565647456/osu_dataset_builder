@@ -77,6 +77,7 @@ fn setup_timeline(mut commands: Commands, ui_font: Res<UiFont>) {
                 ..default()
             },
             BackgroundColor(Color::srgb(0.12, 0.12, 0.16)),
+            Interaction::default(),
             TimelineContainer,
         ))
         .with_children(|parent| {

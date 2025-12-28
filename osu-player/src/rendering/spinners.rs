@@ -2,9 +2,6 @@
 
 use bevy::prelude::*;
 
-use crate::beatmap::{RenderObject, RenderObjectKind, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH};
-use crate::rendering::PlayfieldTransform;
-
 pub struct SpinnersPlugin;
 
 impl Plugin for SpinnersPlugin {

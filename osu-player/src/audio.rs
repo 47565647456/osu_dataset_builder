@@ -105,6 +105,7 @@ fn sync_audio_with_playback(
             
             // Update speed if changed
             if (playback_state.speed - audio_state.speed).abs() > 0.01 {
+                // bevy_kira_audio/kira supports negative playback rates for reverse
                 instance.set_playback_rate(playback_state.speed, AudioTween::default());
                 audio_state.speed = playback_state.speed;
             }
@@ -170,16 +171,26 @@ fn sync_time_from_audio(
                 playback_state.current_time = audio_time_ms;
             }
             
-            // Detect if audio has reached the end
-            if audio_time_ms >= playback_state.total_duration - 100.0 {
-                // Audio finished - stop it and reset for replay
+            // Detect if audio has reached either end
+            if playback_state.speed > 0.0 && audio_time_ms >= playback_state.total_duration - 100.0 {
+                // Audio finished at end - stop it and reset for replay
                 if let Some(mut instance) = audio_instances.remove(&instance_handle) {
                     instance.stop(AudioTween::default());
                 }
                 audio_state.started = false;
                 audio_state.instance = None;
                 playback_state.state = PlaybackState::Paused;
-                log::info!("Audio finished, resetting for replay");
+                log::info!("Audio reached end, pausing");
+            } else if playback_state.speed < 0.0 && audio_time_ms <= 50.0 {
+                // Audio reached start while reversing - stop it
+                if let Some(mut instance) = audio_instances.remove(&instance_handle) {
+                    instance.stop(AudioTween::default());
+                }
+                audio_state.started = false;
+                audio_state.instance = None;
+                playback_state.state = PlaybackState::Paused;
+                playback_state.current_time = 0.0;
+                log::info!("Audio reached start, pausing");
             }
         } else {
             // No position available - audio may have stopped
