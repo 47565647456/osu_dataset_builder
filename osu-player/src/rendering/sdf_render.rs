@@ -1005,8 +1005,17 @@ fn update_sdf_materials(
         if let Some(&opacity) = visible_map.get(&hit_obj.object_index) {
             if let Some(material) = circle_materials.get_mut(material_handle.id()) {
                 if let Some(obj) = beatmap.objects.get(hit_obj.object_index) {
-                    // Update ball position
-                    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, current_time) {
+                    // Hide ball completely before slider starts
+                    if current_time < obj.start_time {
+                        material.uniforms.opacity = 0.0;
+                        continue;
+                    }
+
+                    // Clamp time to active duration for position calculation
+                    // This ensures the ball stays at the end during fade-out
+                    let active_time = current_time.clamp(obj.start_time, obj.end_time);
+
+                    if let Some((ball_x, ball_y)) = beatmap.slider_ball_position(obj, active_time) {
                         let pos = transform.osu_to_screen(ball_x, ball_y);
                         material.uniforms.center = pos;
                         material.uniforms.opacity = opacity;
@@ -1014,7 +1023,7 @@ fn update_sdf_materials(
                         ball_transform.translation.x = pos.x;
                         ball_transform.translation.y = pos.y;
                     } else {
-                        // Ball not visible (slider not active)
+                        // Position failed (should not happen with clamped time)
                         material.uniforms.opacity = 0.0;
                     }
                 }

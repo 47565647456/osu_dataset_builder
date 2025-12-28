@@ -87,6 +87,7 @@ fn setup_timeline(mut commands: Commands, ui_font: Res<UiFont>) {
                     width: Val::Percent(100.0),
                     height: Val::Px(20.0),
                     margin: UiRect::bottom(Val::Px(5.0)),
+                    padding: UiRect::horizontal(Val::Px(80.0)), // Align with scrubber track (70px label + 10px margin)
                     justify_content: JustifyContent::SpaceBetween,
                     ..default()
                 })
@@ -237,11 +238,11 @@ fn spawn_timing_markers(
 
     // Spawn timing point markers as children of the track
     commands.entity(track_entity).with_children(|track| {
+        // Red markers for timing points (BPM changes/sections)
         for timing_point in &beatmap.beatmap.control_points.timing_points {
             let time_ms = timing_point.time;
             let progress = (time_ms / beatmap.total_duration).clamp(0.0, 1.0) as f32;
 
-            // Spawn a thin red vertical line at this position
             track.spawn((
                 Node {
                     position_type: PositionType::Absolute,
@@ -250,9 +251,30 @@ fn spawn_timing_markers(
                     left: Val::Percent(progress * 100.0),
                     ..default()
                 },
-                BackgroundColor(Color::srgb(1.0, 0.3, 0.3)),  // Red for timing points
+                BackgroundColor(Color::srgb(1.0, 0.3, 0.3)),
                 TimingPointMarker,
             ));
+        }
+
+        // Yellow markers for Kiai sections
+        for effect_point in &beatmap.beatmap.control_points.effect_points {
+            if effect_point.kiai {
+                let time_ms = effect_point.time;
+                let progress = (time_ms / beatmap.total_duration).clamp(0.0, 1.0) as f32;
+
+                track.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: Val::Px(2.0),
+                        height: Val::Percent(60.0), // Shorter than timing markers
+                        top: Val::Percent(20.0),
+                        left: Val::Percent(progress * 100.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(1.0, 1.0, 0.3)), // Yellow for Kiai
+                    TimingPointMarker,
+                ));
+            }
         }
     });
 }

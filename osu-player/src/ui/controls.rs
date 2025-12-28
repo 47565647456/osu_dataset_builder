@@ -17,7 +17,8 @@ impl Plugin for ControlsPlugin {
             .add_systems(Update, update_object_count)
             .add_systems(Update, update_zoom_display)
             .add_systems(Update, handle_button_clicks)
-            .add_systems(Update, handle_zoom_clicks);
+            .add_systems(Update, handle_zoom_clicks)
+            .add_systems(Update, handle_reset_clicks);
     }
 }
 
@@ -415,6 +416,21 @@ fn handle_zoom_clicks(
     for interaction in plus_query.iter() {
         if *interaction == Interaction::Pressed {
             zoom.level = (zoom.level + step).min(max_zoom);
+        }
+    }
+}
+
+/// Handle view reset button clicks
+fn handle_reset_clicks(
+    mut zoom: ResMut<ZoomLevel>,
+    mut transform: ResMut<crate::rendering::PlayfieldTransform>,
+    query: Query<&Interaction, (Changed<Interaction>, With<ResetViewButton>)>,
+) {
+    for interaction in query.iter() {
+        if *interaction == Interaction::Pressed {
+            zoom.level = 1.0;
+            transform.user_offset = Vec2::ZERO;
+            transform.generation = transform.generation.wrapping_add(1);
         }
     }
 }
