@@ -96,6 +96,10 @@ pub struct MsdfAtlas {
     pub texture: Handle<Image>,
     /// UV bounds for digits 0-9 (left, bottom, right, top) normalized 0-1
     pub digit_uvs: [Vec4; 10],
+    /// Advance width for digits 0-9 (normalized to em size)
+    pub digit_advances: [f32; 10],
+    /// Aspect ratio (width / height) for digits 0-9
+    pub digit_sizes: [Vec2; 10],
     /// Distance range from atlas generation
     pub px_range: f32,
 }
@@ -105,6 +109,8 @@ impl Default for MsdfAtlas {
         Self {
             texture: Handle::default(),
             digit_uvs: [Vec4::ZERO; 10],
+            digit_advances: [0.5; 10],
+            digit_sizes: [Vec2::ONE; 10],
             px_range: 2.0, 
         }
     }
@@ -116,7 +122,8 @@ struct AtlasBounds { left: f32, bottom: f32, right: f32, top: f32 }
 
 #[derive(Deserialize)]
 struct Glyph { 
-    unicode: u32, 
+    unicode: u32,
+    advance: f32,
     #[serde(rename = "atlasBounds")]
     atlas_bounds: Option<AtlasBounds> 
 }
@@ -177,7 +184,14 @@ fn setup_msdf_atlas(
                             bounds.right / width,
                             1.0 - (bounds.bottom / height)    // Flip Y
                         );
+
+                        // Calculate aspect ratio from atlas bounds
+                        let w = bounds.right - bounds.left;
+                        let h = bounds.top - bounds.bottom;
+                        let aspect = if h > 0.0 { w / h } else { 1.0 };
+                        atlas.digit_sizes[index] = Vec2::new(aspect, 1.0);
                     }
+                    atlas.digit_advances[index] = glyph.advance;
                 }
             }
             
@@ -413,24 +427,48 @@ fn spawn_combo_digits(
     
     // Convert combo number to string to get individual digits
     let combo_str = obj.combo_number.to_string();
-    let num_digits = combo_str.len();
     
-    // Calculate spacing and starting position for centered digits
-    let digit_width = digit_size * 0.7;  // Width of each digit including spacing
-    let total_width = digit_width * num_digits as f32;
-    let start_x = pos.x - total_width * 0.5 + digit_width * 0.5;
+    // Calculate total width using actual advances
+    let mut total_width = 0.0;
+    for ch in combo_str.chars() {
+        let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
+        let advance = atlas.digit_advances.get(digit_value).copied().unwrap_or(0.5);
+        total_width += advance * digit_size;
+    }
+    
+    // Start X position to center the whole string
+    let mut current_x = pos.x - total_width * 0.5;
     
     // Z-ordering: digits on very top (above all SDF materials)
     let z = 0.0 - (index as f32 * 0.0001);
     
-    for (i, ch) in combo_str.chars().enumerate() {
+    for ch in combo_str.chars() {
         let digit_value = ch.to_digit(10).unwrap_or(0) as usize;
-        let digit_x = start_x + i as f32 * digit_width;
-        let digit_center = Vec2::new(digit_x, pos.y);
         
-        // Create mesh for this digit - size matches digit dimensions
-        let mesh_size = digit_size;  // Single digit size, not doubled
-        let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size * 1.2));  // Slightly taller for proper aspect
+        let advance = atlas.digit_advances.get(digit_value).copied().unwrap_or(0.5);
+        let size_ratio = atlas.digit_sizes.get(digit_value).copied().unwrap_or(Vec2::ONE);
+        
+        // Use aspect ratio to size the mesh width
+        let glyph_width = digit_size * size_ratio.x;
+        let glyph_height = digit_size; // Height is constant based on font size
+
+        // Center the glyph within its advance width
+        // Advance is usually slightly larger than glyph width for spacing
+        // We position the center of the glyph
+        let advance_width = advance * digit_size;
+        let digit_center_x = current_x + advance_width * 0.5;
+        
+        // Create mesh matching the glyph aspect ratio
+        // Add 20% padding to height to match previous tweaking/visuals if needed, 
+        // but strictly following bounds is better. Keeping 1.2 multiplier for now as in original code
+        // Update: Original code used digit_size * 1.2 for height. Let's stick to base height radius*0.5 
+        // but we might need to adjust scale if it looks too small.
+        // The original code:
+        // let digit_size = radius * 0.5; 
+        // let mesh = Mesh::from(Rectangle::new(mesh_size, mesh_size * 1.2));
+        
+        // New approach: width = glyph_width, height = glyph_height * 1.2 (to allow for ascenders/descenders visual padding)
+        let mesh = Mesh::from(Rectangle::new(glyph_width, glyph_height * 1.2)); 
         let mesh_handle = meshes.add(mesh);
         
         // Get UV bounds for this digit from the atlas (use digit 0 as fallback)
@@ -451,9 +489,12 @@ fn spawn_combo_digits(
         commands.spawn((
             Mesh2d(mesh_handle),
             MeshMaterial2d(material_handle),
-            Transform::from_xyz(digit_center.x, digit_center.y, z),
+            Transform::from_xyz(digit_center_x, pos.y, z),
             SdfDigit { object_index: index },
         ));
+
+        // Advance cursor
+        current_x += advance_width;
     }
 }
 

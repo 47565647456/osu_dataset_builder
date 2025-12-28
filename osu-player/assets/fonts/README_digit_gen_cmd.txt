@@ -1,1 +1,1 @@
-.\msdf-atlas-gen.exe -font NotoSansCJKjp-Regular.otf -type msdf -charset digits_charset.txt -imageout digits_msdf.png -json digits_msdf.json -size 64
+.\msdf-atlas-gen.exe -font Exo2-ExtraLight.otf -type msdf -charset digits_charset.txt -imageout digits_msdf.png -json digits_msdf.json -size 64
